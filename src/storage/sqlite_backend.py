@@ -189,6 +189,13 @@ class SQLiteBackend(StorageBackend):
             "created_at": str(user.created_at),
         }
 
+    async def delete_user(self, user_id: int) -> None:
+        """删除用户及所有关联的会话和消息（级联删除）"""
+        async with self._session_factory() as db:
+            await db.execute(delete(SessionModel).where(SessionModel.user_id == user_id))
+            await db.execute(delete(UserModel).where(UserModel.id == user_id))
+            await db.commit()
+
     # ------------------------------------------------------------------
     # 会话操作
     # ------------------------------------------------------------------

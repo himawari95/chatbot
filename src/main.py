@@ -142,6 +142,20 @@ async def login(req: LoginRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
 
+# --- 用户删除 ---
+
+
+@app.delete("/users/{user_id}")
+async def delete_user(user_id: int):
+    """删除用户及其所有关联数据（会话、消息），不可恢复"""
+    try:
+        await _user_manager.delete_user(user_id)
+        return {"ok": True}
+    except Exception:
+        logger.exception("删除用户失败")
+        raise HTTPException(status_code=500, detail="删除用户失败")
+
+
 # --- 非流式聊天 ---
 
 

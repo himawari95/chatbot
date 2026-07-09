@@ -36,3 +36,14 @@ class UserManager:
     async def get_user(self, username: str) -> dict | None:
         """根据用户名查找用户"""
         return await self._storage.get_user(username.strip())
+
+    async def delete_user(self, user_id: int) -> None:
+        """删除用户及其关联的所有数据
+
+        参数:
+            user_id: 要删除的用户 ID
+
+        异常:
+            ValueError: 如果用户 ID 无效
+        """
+        await self._storage.delete_user(user_id)

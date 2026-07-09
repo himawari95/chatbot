@@ -164,6 +164,19 @@ async def _fetch_messages(
     return []
 
 
+async def _delete_user_api(user_id: int) -> bool:
+    """调用后端删除用户"""
+    try:
+        async with httpx.AsyncClient() as c:
+            r = await c.delete(
+                f"{BACKEND_URL}/users/{user_id}",
+                timeout=5.0,
+            )
+            return r.status_code == 200
+    except Exception:
+        return False
+
+
 async def _build_dropdown(user_id: int) -> tuple[list, str | None]:
     """构建会话下拉选项"""
     sessions = await _fetch_sessions(user_id)
@@ -227,24 +240,34 @@ async def login(username: str) -> tuple:
     """用户登录或切换用户，加载会话列表和历史"""
     if not username.strip():
         return (
-            gr.update(),
+            gr.update(),   # user_state
+            "",            # username_state
             "### ⚠️ 请输入用户名",
-            gr.update(),
-            [], "", gr.update(), gr.update(value=""),
-            "default",
+            gr.update(),   # session_dd
+            [],            # chatbot
+            "",            # session_state
+            gr.update(),   # msg_box
+            gr.update(value=""),  # rename_box
+            "default",     # role_state
+            False,         # delete_pending_state
+            gr.update(value="🗑 删除用户", variant="stop"),  # delete_user_btn
         )
 
     user = await _login_user(username.strip())
     if not user:
         return (
             gr.update(),
+            "",
             "### 🔴 登录失败 — 请检查后端是否正常",
             gr.update(),
             [], "", gr.update(), gr.update(value=""),
             "default",
+            False,
+            gr.update(value="🗑 删除用户", variant="stop"),
         )
 
     user_id = user["id"]
+    username_val = user["username"]
     choices, default_id = await _build_dropdown(user_id)
 
     if default_id:
@@ -262,14 +285,58 @@ async def login(username: str) -> tuple:
 
     return (
         user_id,
-        f"### 🟢 当前用户：**{user['username']}**",
+        username_val,
+        f"### 🟢 当前用户：**{username_val}**",
         gr.update(choices=choices, value=default_id),
         history,
         default_id or "",
         gr.update(),
         gr.update(value=""),
         session_role,
+        False,
+        gr.update(value="🗑 删除用户", variant="stop"),
     )
+
+
+async def delete_user(
+    user_id: int, username: str, delete_pending: bool
+) -> tuple:
+    """删除用户 — 首次点击进入确认状态，再次点击执行删除"""
+    if not user_id:
+        return (
+            gr.update(), "", "### ⚠️ 请先登录后再操作",
+            gr.update(), [], "", gr.update(),
+            gr.update(value=""), "default", False,
+            gr.update(value="🗑 删除用户", variant="stop"),
+        )
+
+    if not delete_pending:
+        # 第一次点击：进入确认状态
+        return (
+            gr.update(), username,
+            f"### ⚠️ 确定要删除用户 **{username}** 吗？此操作将删除该用户的所有数据（会话、消息），不可恢复！",
+            gr.update(), [], "", gr.update(),
+            gr.update(value=""), "default", True,
+            gr.update(value="⚠️ 确认删除", variant="stop"),
+        )
+
+    # 第二次点击：执行删除
+    success = await _delete_user_api(user_id)
+    if success:
+        return (
+            None, "", "### ⚠️ 用户已删除，请重新登录",
+            gr.update(choices=[], value=None), [], "", gr.update(),
+            gr.update(value=""), "default", False,
+            gr.update(value="🗑 删除用户", variant="stop"),
+        )
+    else:
+        return (
+            user_id, username,
+            "### 🔴 删除失败 — 请检查后端是否正常",
+            gr.update(), [], "", gr.update(),
+            gr.update(value=""), "default", False,
+            gr.update(value="🗑 删除用户", variant="stop"),
+        )
 
 
 async def respond(
@@ -431,7 +498,9 @@ def build_ui() -> gr.Blocks:
         # --- 状态 ---
         session_state = gr.State("")
         user_state = gr.State(None)
+        username_state = gr.State("")
         role_state = gr.State("default")
+        delete_pending_state = gr.State(False)
 
         # --- 页头 ---
         gr.Markdown("# 🤖 Chatbot")
@@ -447,6 +516,7 @@ def build_ui() -> gr.Blocks:
                 container=False,
             )
             login_btn = gr.Button("登录 / 切换", scale=1, variant="primary", size="sm")
+            delete_user_btn = gr.Button("🗑 删除用户", scale=1, variant="stop", size="sm")
 
         # --- 控制行 ---
         with gr.Row(equal_height=True):
@@ -516,8 +586,19 @@ def build_ui() -> gr.Blocks:
             login,
             inputs=[login_box],
             outputs=[
-                user_state, user_md, session_dd, chatbot,
+                user_state, username_state, user_md, session_dd, chatbot,
                 session_state, msg_box, rename_box, role_state,
+                delete_pending_state, delete_user_btn,
+            ],
+        )
+
+        delete_user_btn.click(
+            delete_user,
+            inputs=[user_state, username_state, delete_pending_state],
+            outputs=[
+                user_state, username_state, user_md, session_dd, chatbot,
+                session_state, msg_box, rename_box, role_state,
+                delete_pending_state, delete_user_btn,
             ],
         )
 
