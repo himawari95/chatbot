@@ -1,6 +1,6 @@
 """
-Chatbot Frontend — Gradio UI
-Streaming chat, multi-user support, role/persona switching, session management.
+Chatbot 前端 — Gradio Web UI
+提供流式聊天、多用户支持、角色/人设切换和会话管理功能
 """
 
 import asyncio
@@ -10,28 +10,28 @@ from typing import AsyncGenerator
 import gradio as gr
 import httpx
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-BACKEND_URL = "http://127.0.0.1:8000"
-BOT_AVATAR = "https://api.dicebear.com/9.x/bottts-neutral/svg?seed=chatbot"
-USER_AVATAR = None
+from src.core.preset_manager import get_preset_manager
+from src.interface.ui_protocol import BackendConfig, BOT_AVATAR, USER_AVATAR
 
-ROLE_OPTIONS = [
-    ("默认", "default"),
-    ("👨‍🏫 老师", "teacher"),
-    ("👨‍💻 程序员", "programmer"),
-    ("🧠 哲学家", "philosopher"),
-    ("🤝 朋友", "friend"),
-]
+# =============================================================================
+# 常量
+# =============================================================================
+
+_backend = BackendConfig()
+BACKEND_URL = _backend.base_url
+
+# 从预设管理器加载角色选项
+_presets = get_preset_manager()
+ROLE_OPTIONS = _presets.to_choices()
 
 
-# ===================================================================
-# API Helpers (async)
-# ===================================================================
+# =============================================================================
+# API 辅助函数（异步）
+# =============================================================================
 
 
 async def _health_check() -> str:
+    """检测后端服务是否可用"""
     try:
         async with httpx.AsyncClient() as c:
             r = await c.get(f"{BACKEND_URL}/health", timeout=5.0)
@@ -39,10 +39,11 @@ async def _health_check() -> str:
                 return "### 🟢 后端已连接"
     except Exception:
         pass
-    return "### 🔴 后端不可用 — 请先启动 `uvicorn backend.main:app`"
+    return "### 🔴 后端不可用 — 请先启动服务"
 
 
 async def _fetch_models() -> list[str]:
+    """获取可用模型列表"""
     try:
         async with httpx.AsyncClient() as c:
             r = await c.get(f"{BACKEND_URL}/models", timeout=5.0)
@@ -54,6 +55,7 @@ async def _fetch_models() -> list[str]:
 
 
 async def _login_user(username: str) -> dict | None:
+    """调用后端登录接口"""
     try:
         async with httpx.AsyncClient() as c:
             r = await c.post(
@@ -69,6 +71,7 @@ async def _login_user(username: str) -> dict | None:
 
 
 async def _fetch_sessions(user_id: int) -> list[dict]:
+    """获取用户的会话列表"""
     try:
         async with httpx.AsyncClient() as c:
             r = await c.get(
@@ -82,6 +85,7 @@ async def _fetch_sessions(user_id: int) -> list[dict]:
 
 
 async def _create_session_api(user_id: int, role: str = "default") -> dict | None:
+    """调用后端创建新会话"""
     try:
         async with httpx.AsyncClient() as c:
             r = await c.post(
@@ -97,6 +101,7 @@ async def _create_session_api(user_id: int, role: str = "default") -> dict | Non
 
 
 async def _delete_session_api(session_id: str, user_id: int) -> bool:
+    """调用后端删除会话"""
     try:
         async with httpx.AsyncClient() as c:
             r = await c.delete(
@@ -110,6 +115,7 @@ async def _delete_session_api(session_id: str, user_id: int) -> bool:
 
 
 async def _rename_session_api(session_id: str, title: str, user_id: int) -> dict | None:
+    """调用后端重命名会话"""
     try:
         async with httpx.AsyncClient() as c:
             r = await c.put(
@@ -125,6 +131,7 @@ async def _rename_session_api(session_id: str, title: str, user_id: int) -> dict
 
 
 async def _update_role_api(session_id: str, role: str, user_id: int) -> dict | None:
+    """调用后端更新会话角色"""
     try:
         async with httpx.AsyncClient() as c:
             r = await c.put(
@@ -142,6 +149,7 @@ async def _update_role_api(session_id: str, role: str, user_id: int) -> dict | N
 async def _fetch_messages(
     session_id: str, user_id: int, role_name: str = "default"
 ) -> list[dict]:
+    """获取指定会话和角色的消息历史"""
     try:
         async with httpx.AsyncClient() as c:
             r = await c.get(
@@ -157,7 +165,7 @@ async def _fetch_messages(
 
 
 async def _build_dropdown(user_id: int) -> tuple[list, str | None]:
-    """Build (choices, default_id) for session dropdown."""
+    """构建会话下拉选项"""
     sessions = await _fetch_sessions(user_id)
     choices = []
     for s in sessions:
@@ -167,14 +175,15 @@ async def _build_dropdown(user_id: int) -> tuple[list, str | None]:
     return choices, default_id
 
 
-# ===================================================================
-# Streaming helper
-# ===================================================================
+# =============================================================================
+# 流式辅助
+# =============================================================================
 
 
 async def _stream_tokens(
     message: str, session_id: str, model: str, user_id: int, role: str
 ) -> AsyncGenerator[str, None]:
+    """连接后端 SSE 端点，逐 token 产出内容"""
     async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0)) as c:
         async with c.stream(
             "POST",
@@ -189,7 +198,7 @@ async def _stream_tokens(
         ) as resp:
             if resp.status_code != 200:
                 text = await resp.aread()
-                raise RuntimeError(f"Backend returned {resp.status_code}: {text[:200]}")
+                raise RuntimeError(f"后端返回 {resp.status_code}: {text[:200]}")
 
             async for line in resp.aiter_lines():
                 if not line.startswith("data: "):
@@ -209,23 +218,20 @@ async def _stream_tokens(
                     return
 
 
-# ===================================================================
-# UI Event Handlers
-# ===================================================================
+# =============================================================================
+# UI 事件处理器
+# =============================================================================
 
 
 async def login(username: str) -> tuple:
-    """Login or switch user. Clears chat and reloads sessions."""
+    """用户登录或切换用户，加载会话列表和历史"""
     if not username.strip():
         return (
-            gr.update(),  # user_state
+            gr.update(),
             "### ⚠️ 请输入用户名",
-            gr.update(),  # session_dd
-            [],           # chatbot
-            "",           # session_state
-            gr.update(),  # msg_box
-            gr.update(value=""),  # rename_box
-            "default",    # role_state
+            gr.update(),
+            [], "", gr.update(), gr.update(value=""),
+            "default",
         )
 
     user = await _login_user(username.strip())
@@ -274,7 +280,7 @@ async def respond(
     user_id: int,
     role: str,
 ):
-    """Main chat handler — streams assistant reply token-by-token."""
+    """主聊天处理器 — 逐 token 流式输出 AI 回复"""
     if not message.strip():
         yield history, gr.update(), session_id
         return
@@ -304,7 +310,7 @@ async def respond(
 
     except httpx.ConnectError:
         history[-1]["content"] = (
-            "⚠️ 无法连接到后端服务，请确认 `uvicorn backend.main:app` 已启动。"
+            "⚠️ 无法连接到后端服务，请确认服务已启动。"
         )
         yield history, gr.update(), session_id
     except httpx.ReadTimeout:
@@ -319,7 +325,7 @@ async def respond(
 
 
 async def create_session(user_id: int, role: str) -> tuple[str, list, dict]:
-    """Create a new session for the current user with the given role."""
+    """创建新会话"""
     if not user_id:
         return "", [], gr.update()
     session = await _create_session_api(user_id, role)
@@ -331,11 +337,10 @@ async def create_session(user_id: int, role: str) -> tuple[str, list, dict]:
 
 
 async def switch_session(session_id: str, user_id: int) -> tuple[list, str, dict, str]:
-    """Load chat history and restore role for the selected session."""
+    """切换到指定会话，加载对应角色的消息历史"""
     if not session_id or not user_id:
         return [], "", gr.update(), "default"
 
-    # Restore role from session, then load role-specific messages
     sessions = await _fetch_sessions(user_id)
     session_role = "default"
     for s in sessions:
@@ -351,7 +356,7 @@ async def switch_session(session_id: str, user_id: int) -> tuple[list, str, dict
 
 
 async def delete_session(session_id: str, user_id: int) -> tuple[list, str, dict, str]:
-    """Delete the selected session and switch to another."""
+    """删除当前会话并自动切换到另一个"""
     if not session_id or not user_id:
         return [], "", gr.update(), "default"
     await _delete_session_api(session_id, user_id)
@@ -375,7 +380,7 @@ async def delete_session(session_id: str, user_id: int) -> tuple[list, str, dict
 async def rename_session(
     session_id: str, new_title: str, user_id: int
 ) -> tuple[dict, dict]:
-    """Rename the current session. Clears rename box on success."""
+    """重命名当前会话"""
     if not session_id or not new_title.strip() or not user_id:
         choices, _ = await _build_dropdown(user_id) if user_id else ([], None)
         return gr.update(choices=choices, value=session_id), gr.update()
@@ -387,7 +392,7 @@ async def rename_session(
 async def change_role(
     session_id: str, role: str, user_id: int
 ) -> tuple[list, str, str, dict]:
-    """Switch role: load that role's message history into the chat window."""
+    """切换角色：加载该角色对应的消息历史"""
     if not user_id:
         return [], session_id, role, gr.update()
     if session_id:
@@ -402,7 +407,7 @@ async def change_role(
 
 
 def on_startup():
-    """Run once when page loads — health check, fetch models."""
+    """页面加载时的初始化回调"""
 
     async def _init():
         status, models = await asyncio.gather(_health_check(), _fetch_models())
@@ -414,25 +419,26 @@ def on_startup():
     return asyncio.run(_init())
 
 
-# ===================================================================
-# UI Layout
-# ===================================================================
+# =============================================================================
+# UI 布局
+# =============================================================================
 
 
 def build_ui() -> gr.Blocks:
-    with gr.Blocks(title="Chatbot") as demo:
+    """构建 Gradio 界面"""
+    with gr.Blocks(title="Chatbot — LangChain Chat v1.1") as demo:
 
-        # --- State ---
+        # --- 状态 ---
         session_state = gr.State("")
         user_state = gr.State(None)
         role_state = gr.State("default")
 
-        # --- Header ---
+        # --- 页头 ---
         gr.Markdown("# 🤖 Chatbot")
         status_md = gr.Markdown("⏳ 正在检查后端...")
         user_md = gr.Markdown("### ⚠️ 请先登录")
 
-        # --- Login Row ---
+        # --- 登录行 ---
         with gr.Row(equal_height=True):
             login_box = gr.Textbox(
                 placeholder="输入用户名...",
@@ -442,7 +448,7 @@ def build_ui() -> gr.Blocks:
             )
             login_btn = gr.Button("登录 / 切换", scale=1, variant="primary", size="sm")
 
-        # --- Controls Row ---
+        # --- 控制行 ---
         with gr.Row(equal_height=True):
             model_dd = gr.Dropdown(
                 label="模型",
@@ -468,7 +474,7 @@ def build_ui() -> gr.Blocks:
             new_btn = gr.Button("＋ 新会话", scale=1, variant="secondary", size="sm")
             del_btn = gr.Button("🗑", scale=0, variant="stop", size="sm", min_width=40)
 
-        # --- Rename Row ---
+        # --- 重命名行 ---
         with gr.Row(equal_height=True):
             rename_box = gr.Textbox(
                 placeholder="输入新标题...",
@@ -478,14 +484,14 @@ def build_ui() -> gr.Blocks:
             )
             rename_btn = gr.Button("✏️ 重命名", scale=1, variant="secondary", size="sm")
 
-        # --- Chat Display ---
+        # --- 聊天显示区 ---
         chatbot = gr.Chatbot(
             height=520,
             avatar_images=(USER_AVATAR, BOT_AVATAR),
             label="",
         )
 
-        # --- Input Row ---
+        # --- 输入行 ---
         with gr.Row(equal_height=True):
             msg_box = gr.Textbox(
                 placeholder="输入消息，Enter 发送...",
@@ -495,16 +501,16 @@ def build_ui() -> gr.Blocks:
             )
             send_btn = gr.Button("发送", scale=1, variant="primary")
 
-        # --- Example prompts ---
+        # --- 快捷提问 ---
         gr.Examples(
             examples=["你好，介绍一下自己", "用 Python 写一个快速排序", "推荐三本科幻小说"],
             inputs=[msg_box],
             label="快捷提问",
         )
 
-        # ============================================================
-        # Event Wiring
-        # ============================================================
+        # ================================================================
+        # 事件绑定
+        # ================================================================
 
         login_btn.click(
             login,
@@ -565,9 +571,9 @@ def build_ui() -> gr.Blocks:
     return demo
 
 
-# ===================================================================
-# Entry Point
-# ===================================================================
+# =============================================================================
+# 入口
+# =============================================================================
 
 _demo = build_ui()
 

@@ -1,0 +1,42 @@
+# =============================================================================
+# Chatbot 全局配置文件
+# =============================================================================
+
+# --- 服务器配置 ---
+server:
+  host: "127.0.0.1"
+  port: 8000
+  cors_origins:
+    - "*"
+
+# --- 数据库配置 ---
+database:
+  type: "sqlite"                 # 当前仅支持 sqlite
+  path: "data/sqlite/chatbot.db"
+
+# --- LLM 模型注册表 ---
+models:
+  - name: "deepseek-chat"
+    api_key_env: "DEEPSEEK_API_KEY"
+    base_url_env: "DEEPSEEK_BASE_URL"
+  - name: "qwen-turbo"
+    api_key_env: "DASHSCOPE_API_KEY"
+    base_url_env: "DASHSCOPE_BASE_URL"
+  - name: "glm-4"
+    api_key_env: "ZHIPU_API_KEY"
+    base_url_env: "ZHIPU_BASE_URL"
+  - name: "moonshot-v1"
+    api_key_env: "MOONSHOT_API_KEY"
+    base_url_env: "MOONSHOT_BASE_URL"
+
+# --- LLM 参数 ---
+llm:
+  default_model: "deepseek-chat"
+  temperature: 0.7
+  max_tokens: 2048
+
+# --- Gradio UI 配置 ---
+ui:
+  host: "127.0.0.1"
+  port: 7860
+  share: false

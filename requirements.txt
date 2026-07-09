@@ -2,9 +2,14 @@ fastapi
 uvicorn
 gradio
 langchain
+langchain-classic
 langchain-openai
 python-dotenv
 httpx
 sse-starlette
 sqlalchemy
 aiosqlite
+pyyaml
+pydantic-settings
+rich
+prompt_toolkit

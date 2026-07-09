@@ -1,0 +1,36 @@
+# =============================================================================
+# 日志配置
+# =============================================================================
+
+version: 1
+disable_existing_loggers: false
+
+formatters:
+  default:
+    format: "[%(asctime)s] %(levelname)s | %(name)s | %(message)s"
+    datefmt: "%Y-%m-%d %H:%M:%S"
+  simple:
+    format: "%(levelname)s | %(message)s"
+
+handlers:
+  console:
+    class: "logging.StreamHandler"
+    level: "INFO"
+    formatter: "simple"
+    stream: "ext://sys.stdout"
+  file:
+    class: "logging.FileHandler"
+    level: "DEBUG"
+    formatter: "default"
+    filename: "logs/chatbot.log"
+    encoding: "utf-8"
+
+loggers:
+  chatbot:
+    level: "DEBUG"
+    handlers: ["console", "file"]
+    propagate: false
+  uvicorn:
+    level: "INFO"
+    handlers: ["console"]
+    propagate: false
