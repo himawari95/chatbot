@@ -119,15 +119,41 @@ class SessionManager:
         return await self._storage.get_messages_for_role(session_id, role_name)
 
     async def save_message(
-        self, session_id: str, role: str, content: str, role_name: str = "default"
+        self, session_id: str, role: str, content: str, role_name: str = "default",
+        prompt_tokens: int = 0, completion_tokens: int = 0, total_tokens: int = 0,
     ) -> None:
-        """保存消息到数据库"""
-        await self._storage.save_message(session_id, role, content, role_name)
+        """保存消息到数据库，可附带 token 用量"""
+        await self._storage.save_message(
+            session_id, role, content, role_name,
+            prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, total_tokens=total_tokens,
+        )
         if not session_id:
             return
         # 自动设置会话标题（取第一条用户消息前20字符）
         if role == "user":
             await self._storage.auto_title(session_id, content)
+
+    # ------------------------------------------------------------------
+    # Token 统计
+    # ------------------------------------------------------------------
+
+    async def get_session_tokens(self, session_id: str) -> dict:
+        """获取会话累计 token 用量"""
+        return await self._storage.get_session_tokens(session_id)
+
+    async def update_session_tokens(self, session_id: str) -> None:
+        """更新会话 token 累计值"""
+        await self._storage.update_session_tokens(session_id)
+
+    # ------------------------------------------------------------------
+    # 搜索
+    # ------------------------------------------------------------------
+
+    async def search_messages(self, user_id: int, keyword: str) -> list[dict]:
+        """搜索用户消息，空关键词返回空列表"""
+        if not keyword.strip():
+            return []
+        return await self._storage.search_messages(user_id, keyword.strip())
 
     async def load_memory(
         self, session_id: str, role_name: str

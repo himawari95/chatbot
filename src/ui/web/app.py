@@ -246,6 +246,54 @@ async def _delete_preset_api(preset_id: int, user_id: int) -> bool:
         return False
 
 
+async def _fetch_session_tokens(session_id: str, user_id: int) -> dict:
+    """获取会话累计 token 用量"""
+    try:
+        async with httpx.AsyncClient() as c:
+            r = await c.get(
+                f"{BACKEND_URL}/sessions/{session_id}/tokens",
+                params={"user_id": user_id},
+                timeout=5.0,
+            )
+            if r.status_code == 200:
+                return r.json()
+    except Exception:
+        pass
+    return {"total_prompt_tokens": 0, "total_completion_tokens": 0, "total_tokens": 0}
+
+
+async def _search_messages_api(user_id: int, keyword: str) -> list[dict]:
+    """搜索用户消息"""
+    try:
+        async with httpx.AsyncClient() as c:
+            r = await c.get(
+                f"{BACKEND_URL}/search",
+                params={"user_id": user_id, "keyword": keyword},
+                timeout=5.0,
+            )
+            if r.status_code == 200:
+                return r.json().get("results", [])
+    except Exception:
+        pass
+    return []
+
+
+def _format_tokens(last_usage: dict, cumulative: dict) -> str:
+    """格式化 token 用量为 Markdown"""
+    lp = last_usage.get("prompt_tokens", 0)
+    lc = last_usage.get("completion_tokens", 0)
+    lt = last_usage.get("total_tokens", 0)
+    cp = cumulative.get("total_prompt_tokens", 0)
+    cc = cumulative.get("total_completion_tokens", 0)
+    ct = cumulative.get("total_tokens", 0)
+    lines = []
+    if lt > 0:
+        lines.append(f"**本轮**：输入 {lp} | 输出 {lc} | 合计 {lt}")
+    if ct > 0:
+        lines.append(f"**累计**：输入 {cp} | 输出 {cc} | 合计 {ct}")
+    return "  \n".join(lines) if lines else ""
+
+
 async def _refresh_role_choices(user_id: int) -> list[tuple[str, str]]:
     """刷新角色下拉选项（内置 + 用户自定义）"""
     if not user_id:
@@ -281,9 +329,12 @@ async def _build_dropdown(user_id: int) -> tuple[list, str | None]:
 
 
 async def _stream_tokens(
-    message: str, session_id: str, model: str, user_id: int, role: str
+    message: str, session_id: str, model: str, user_id: int, role: str,
+    usage_out: dict | None = None,
 ) -> AsyncGenerator[str, None]:
-    """连接后端 SSE 端点，逐 token 产出内容"""
+    """连接后端 SSE 端点，逐 token 产出内容。
+    若传入 usage_out，则在流结束后将 token 用量写入该字典。
+    """
     async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0)) as c:
         async with c.stream(
             "POST",
@@ -315,6 +366,8 @@ async def _stream_tokens(
                     yield payload["content"]
 
                 if "done" in payload:
+                    if usage_out is not None and "usage" in payload:
+                        usage_out.update(payload["usage"])
                     return
 
 
@@ -455,48 +508,57 @@ async def respond(
     user_id: int,
     role: str,
 ):
-    """主聊天处理器 — 逐 token 流式输出 AI 回复"""
+    """主聊天处理器 — 逐 token 流式输出 AI 回复，完成后显示 token 用量"""
     if not message.strip():
-        yield history, gr.update(), session_id
+        yield history, gr.update(), session_id, gr.update()
         return
 
     if not user_id:
         history.append({"role": "assistant", "content": "⚠️ 请先登录后再发送消息"})
-        yield history, gr.update(), session_id
+        yield history, gr.update(), session_id, gr.update()
         return
 
     if not session_id:
         session = await _create_session_api(user_id, role, model)
         if not session:
             history.append({"role": "assistant", "content": "⚠️ 无法创建会话"})
-            yield history, gr.update(), ""
+            yield history, gr.update(), "", gr.update()
             return
         session_id = session["id"]
 
     history.append({"role": "user", "content": message})
-    yield history, gr.update(value=""), session_id
+    yield history, gr.update(value=""), session_id, gr.update()
 
     history.append({"role": "assistant", "content": ""})
 
     try:
-        async for token in _stream_tokens(message, session_id, model, user_id, role):
+        usage_out: dict = {}
+        async for token in _stream_tokens(message, session_id, model, user_id, role, usage_out):
             history[-1]["content"] += token
-            yield history, gr.update(), session_id
+            yield history, gr.update(), session_id, gr.update()
+
+        # 流结束，获取累计 token 统计
+        if usage_out:
+            cumulative = await _fetch_session_tokens(session_id, user_id)
+            token_md = _format_tokens(usage_out, cumulative)
+            yield history, gr.update(), session_id, token_md
+        else:
+            yield history, gr.update(), session_id, gr.update()
 
     except httpx.ConnectError:
         history[-1]["content"] = (
             "⚠️ 无法连接到后端服务，请确认服务已启动。"
         )
-        yield history, gr.update(), session_id
+        yield history, gr.update(), session_id, gr.update()
     except httpx.ReadTimeout:
         history[-1]["content"] += "\n\n⚠️ 请求超时，请重试。"
-        yield history, gr.update(), session_id
+        yield history, gr.update(), session_id, gr.update()
     except RuntimeError as e:
         history[-1]["content"] = f"⚠️ {e}"
-        yield history, gr.update(), session_id
+        yield history, gr.update(), session_id, gr.update()
     except Exception as e:
         history[-1]["content"] = f"⚠️ 发生未知错误：{e}"
-        yield history, gr.update(), session_id
+        yield history, gr.update(), session_id, gr.update()
 
 
 async def create_session(user_id: int, role: str, model_name: str) -> tuple:
@@ -514,7 +576,7 @@ async def create_session(user_id: int, role: str, model_name: str) -> tuple:
 async def switch_session(session_id: str, user_id: int) -> tuple:
     """切换到指定会话，加载对应角色的消息历史"""
     if not session_id or not user_id:
-        return [], "", gr.update(), "default", False, gr.update(value="🗑", variant="stop"), gr.update(visible=False)
+        return [], "", gr.update(), "default", False, gr.update(value="🗑", variant="stop"), gr.update(visible=False), ""
 
     sessions = await _fetch_sessions(user_id)
     session_role = "default"
@@ -526,8 +588,10 @@ async def switch_session(session_id: str, user_id: int) -> tuple:
     messages = await _fetch_messages(session_id, user_id, session_role)
     history = [{"role": m["role"], "content": m["content"]} for m in messages]
     choices, _ = await _build_dropdown(user_id)
+    tokens = await _fetch_session_tokens(session_id, user_id)
+    token_md = _format_tokens({}, tokens)
 
-    return history, session_id, gr.update(choices=choices, value=session_id), session_role, False, gr.update(value="🗑", variant="stop"), gr.update(visible=False)
+    return history, session_id, gr.update(choices=choices, value=session_id), session_role, False, gr.update(value="🗑", variant="stop"), gr.update(visible=False), token_md
 
 
 async def delete_session(
@@ -815,6 +879,26 @@ async def cancel_preset_form():
     )
 
 
+async def search_messages(user_id: int, keyword: str) -> str:
+    """搜索消息并格式化结果"""
+    if not user_id:
+        return "### ⚠️ 请先登录后再搜索"
+    if not keyword.strip():
+        return "### ⚠️ 请输入搜索关键词"
+    results = await _search_messages_api(user_id, keyword.strip())
+    if not results:
+        return f"### 🔍 未找到包含 \"{keyword.strip()}\" 的消息"
+    lines = [f"### 🔍 搜索结果（{len(results)} 条）：keyword \"{keyword.strip()}\"\n"]
+    for i, r in enumerate(results, 1):
+        title = r.get("session_title", "") or r["session_id"]
+        content = r["content"][:200]
+        ts = r.get("timestamp", "")[:16].replace("T", " ")
+        lines.append(f"**{i}.** [{title}] {ts}")
+        lines.append(f"> {content}")
+        lines.append("")
+    return "\n".join(lines)
+
+
 def on_startup():
     """页面加载时的初始化回调"""
 
@@ -943,6 +1027,9 @@ def build_ui() -> gr.Blocks:
             label="",
         )
 
+        # --- Token 用量显示 ---
+        token_md = gr.Markdown("")
+
         # --- 输入行 ---
         with gr.Row(equal_height=True):
             msg_box = gr.Textbox(
@@ -959,6 +1046,18 @@ def build_ui() -> gr.Blocks:
             inputs=[msg_box],
             label="快捷提问",
         )
+
+        # --- 搜索 ---
+        with gr.Accordion("🔍 对话搜索", open=False):
+            with gr.Row(equal_height=True):
+                search_box = gr.Textbox(
+                    placeholder="输入关键词搜索历史消息...",
+                    label="关键词",
+                    scale=4,
+                    container=False,
+                )
+                search_btn = gr.Button("搜索", scale=1, variant="primary", size="sm")
+            search_results_md = gr.Markdown("")
 
         # ================================================================
         # 事件绑定
@@ -991,13 +1090,13 @@ def build_ui() -> gr.Blocks:
         send_btn.click(
             respond,
             inputs=[msg_box, chatbot, session_state, model_dd, user_state, role_state],
-            outputs=[chatbot, msg_box, session_state],
+            outputs=[chatbot, msg_box, session_state, token_md],
         )
 
         msg_box.submit(
             respond,
             inputs=[msg_box, chatbot, session_state, model_dd, user_state, role_state],
-            outputs=[chatbot, msg_box, session_state],
+            outputs=[chatbot, msg_box, session_state, token_md],
         )
 
         new_btn.click(
@@ -1011,7 +1110,8 @@ def build_ui() -> gr.Blocks:
             switch_session,
             inputs=[session_dd, user_state],
             outputs=[chatbot, session_state, session_dd, role_state,
-                     session_delete_pending_state, del_btn, cancel_del_btn],
+                     session_delete_pending_state, del_btn, cancel_del_btn,
+                     token_md],
         )
 
         del_btn.click(
@@ -1114,6 +1214,14 @@ def build_ui() -> gr.Blocks:
                 preset_edit_mode, preset_edit_id, preset_add_btn,
                 preset_delete_pending, preset_del_confirm_btn,
             ],
+        )
+
+        # --- 搜索事件 ---
+
+        search_btn.click(
+            search_messages,
+            inputs=[user_state, search_box],
+            outputs=[search_results_md],
         )
 
         demo.load(

@@ -68,6 +68,7 @@ class ChatEngine:
             openai_api_key=api_key,
             openai_api_base=base_url,
             temperature=self._config.llm_temperature,
+            model_kwargs={"stream_options": {"include_usage": True}},
         )
 
     # ------------------------------------------------------------------
@@ -153,8 +154,9 @@ class ChatEngine:
             # 保存用户消息
             await self._sessions.save_message(session_id, "user", message, role)
 
-            # 流式生成
+            # 流式生成，同时收集 token 用量
             full_response: str = ""
+            usage: dict[str, int] = {}
             async for chunk in llm.astream(messages):
                 content = chunk.content
                 if isinstance(content, str) and content:
@@ -167,16 +169,30 @@ class ChatEngine:
                         )
                         + "\n\n"
                     )
+                # 从最后一个 chunk 提取 token 用量
+                if hasattr(chunk, "usage_metadata") and chunk.usage_metadata:
+                    um = chunk.usage_metadata
+                    usage = {
+                        "prompt_tokens": um.get("input_tokens", 0),
+                        "completion_tokens": um.get("output_tokens", 0),
+                        "total_tokens": um.get("total_tokens", 0),
+                    }
 
-            # 保存完整回复和上下文
+            # 保存完整回复（含 token 用量）并更新会话统计
             self._sessions.save_context(session_id, role, message, full_response)
-            await self._sessions.save_message(session_id, "assistant", full_response, role)
-
-            yield (
-                "data: "
-                + json.dumps({"done": True, "session_id": session_id})
-                + "\n\n"
+            await self._sessions.save_message(
+                session_id, "assistant", full_response, role,
+                prompt_tokens=usage.get("prompt_tokens", 0),
+                completion_tokens=usage.get("completion_tokens", 0),
+                total_tokens=usage.get("total_tokens", 0),
             )
+            if usage:
+                await self._sessions.update_session_tokens(session_id)
+
+            done_payload = {"done": True, "session_id": session_id}
+            if usage:
+                done_payload["usage"] = usage
+            yield "data: " + json.dumps(done_payload, ensure_ascii=False) + "\n\n"
 
         except asyncio.CancelledError:
             logger.info("SSE 流被客户端取消")

@@ -56,6 +56,9 @@ class SessionModel(Base):
     role = Column(String(20), default="default", server_default="default")
     model_name = Column(String(50), default="deepseek-chat", server_default="deepseek-chat")
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    total_prompt_tokens = Column(Integer, default=0)
+    total_completion_tokens = Column(Integer, default=0)
+    total_tokens = Column(Integer, default=0)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
     user = relationship("UserModel", back_populates="sessions")
@@ -89,6 +92,9 @@ class MessageModel(Base):
     role = Column(String(20), nullable=False)      # "user" 或 "assistant"
     role_name = Column(String(20), default="default", server_default="default")
     content = Column(Text, nullable=False)
+    prompt_tokens = Column(Integer, default=0)
+    completion_tokens = Column(Integer, default=0)
+    total_tokens = Column(Integer, default=0)
     timestamp = Column(DateTime, server_default=func.now())
     session = relationship("SessionModel", back_populates="messages")
 
@@ -157,6 +163,22 @@ class SQLiteBackend(StorageBackend):
                 if "model_name" not in sess_cols:
                     logger.info("为 sessions 表添加 'model_name' 列")
                     conn.execute("ALTER TABLE sessions ADD COLUMN model_name VARCHAR(50) DEFAULT 'deepseek-chat'")
+
+                # 为 messages 表添加 token 列（如果缺少）
+                msg_cols2 = [r[1] for r in conn.execute("PRAGMA table_info('messages')").fetchall()]
+                if "prompt_tokens" not in msg_cols2:
+                    logger.info("为 messages 表添加 token 列")
+                    conn.execute("ALTER TABLE messages ADD COLUMN prompt_tokens INTEGER DEFAULT 0")
+                    conn.execute("ALTER TABLE messages ADD COLUMN completion_tokens INTEGER DEFAULT 0")
+                    conn.execute("ALTER TABLE messages ADD COLUMN total_tokens INTEGER DEFAULT 0")
+
+                # 为 sessions 表添加 token 统计列（如果缺少）
+                sess_cols2 = [r[1] for r in conn.execute("PRAGMA table_info('sessions')").fetchall()]
+                if "total_prompt_tokens" not in sess_cols2:
+                    logger.info("为 sessions 表添加 token 统计列")
+                    conn.execute("ALTER TABLE sessions ADD COLUMN total_prompt_tokens INTEGER DEFAULT 0")
+                    conn.execute("ALTER TABLE sessions ADD COLUMN total_completion_tokens INTEGER DEFAULT 0")
+                    conn.execute("ALTER TABLE sessions ADD COLUMN total_tokens INTEGER DEFAULT 0")
 
                 # 检查并创建 presets 表
                 preset_tables = conn.execute(
@@ -250,6 +272,9 @@ class SQLiteBackend(StorageBackend):
             "role": row.role,
             "model_name": row.model_name,
             "user_id": row.user_id,
+            "total_prompt_tokens": row.total_prompt_tokens,
+            "total_completion_tokens": row.total_completion_tokens,
+            "total_tokens": row.total_tokens,
             "created_at": str(row.created_at),
             "updated_at": str(row.updated_at),
         }
@@ -268,6 +293,9 @@ class SQLiteBackend(StorageBackend):
                 "title": r.title,
                 "role": r.role,
                 "model_name": r.model_name,
+                "total_prompt_tokens": r.total_prompt_tokens,
+                "total_completion_tokens": r.total_completion_tokens,
+                "total_tokens": r.total_tokens,
                 "created_at": str(r.created_at),
                 "updated_at": str(r.updated_at),
             }
@@ -337,8 +365,10 @@ class SQLiteBackend(StorageBackend):
         return [{"role": r.role, "content": r.content} for r in rows]
 
     async def save_message(
-        self, session_id: str, role: str, content: str, role_name: str = "default"
+        self, session_id: str, role: str, content: str, role_name: str = "default",
+        prompt_tokens: int = 0, completion_tokens: int = 0, total_tokens: int = 0,
     ) -> None:
+        """保存消息，可选记录 token 用量"""
         async with self._session_factory() as db:
             db.add(
                 MessageModel(
@@ -346,6 +376,9 @@ class SQLiteBackend(StorageBackend):
                     role=role,
                     content=content,
                     role_name=role_name,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=total_tokens,
                 )
             )
             await db.execute(
@@ -365,6 +398,82 @@ class SQLiteBackend(StorageBackend):
             if row and not row.title:
                 row.title = message[:20]
                 await db.commit()
+
+    # ------------------------------------------------------------------
+    # Token 统计
+    # ------------------------------------------------------------------
+
+    async def get_session_tokens(self, session_id: str) -> dict:
+        """获取会话累计 token 用量"""
+        async with self._session_factory() as db:
+            row = (
+                await db.execute(
+                    select(SessionModel).where(SessionModel.id == session_id)
+                )
+            ).scalar_one_or_none()
+        if not row:
+            return {"total_prompt_tokens": 0, "total_completion_tokens": 0, "total_tokens": 0}
+        return {
+            "total_prompt_tokens": row.total_prompt_tokens,
+            "total_completion_tokens": row.total_completion_tokens,
+            "total_tokens": row.total_tokens,
+        }
+
+    async def update_session_tokens(self, session_id: str) -> None:
+        """重新计算并更新会话的 token 累计值（汇总该会话所有消息）"""
+        async with self._session_factory() as db:
+            # 汇总 messages 表中该会话的所有 token
+            result = await db.execute(
+                select(
+                    func.coalesce(func.sum(MessageModel.prompt_tokens), 0),
+                    func.coalesce(func.sum(MessageModel.completion_tokens), 0),
+                    func.coalesce(func.sum(MessageModel.total_tokens), 0),
+                ).where(MessageModel.session_id == session_id)
+            )
+            p_sum, c_sum, t_sum = result.one()
+            await db.execute(
+                update(SessionModel)
+                .where(SessionModel.id == session_id)
+                .values(
+                    total_prompt_tokens=p_sum,
+                    total_completion_tokens=c_sum,
+                    total_tokens=t_sum,
+                )
+            )
+            await db.commit()
+
+    # ------------------------------------------------------------------
+    # 搜索
+    # ------------------------------------------------------------------
+
+    async def search_messages(self, user_id: int, keyword: str) -> list[dict]:
+        """搜索用户所有会话中的消息（JOIN sessions 表，按用户过滤）"""
+        async with self._session_factory() as db:
+            result = await db.execute(
+                select(
+                    MessageModel.session_id,
+                    SessionModel.title.label("session_title"),
+                    MessageModel.content,
+                    MessageModel.timestamp,
+                )
+                .join(SessionModel, MessageModel.session_id == SessionModel.id)
+                .where(
+                    SessionModel.user_id == user_id,
+                    MessageModel.content.ilike(f"%{keyword}%"),
+                )
+                .order_by(MessageModel.timestamp.desc())
+                .limit(50)
+            )
+            rows = result.all()
+        return [
+            {
+                "session_id": r.session_id,
+                "session_title": r.session_title,
+                "content": r.content,
+                "timestamp": str(r.timestamp),
+            }
+            for r in rows
+        ]
 
     # ------------------------------------------------------------------
     # 预设操作

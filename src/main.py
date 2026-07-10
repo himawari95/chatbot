@@ -373,6 +373,37 @@ async def get_session_messages(
         raise
 
 
+# --- Token 统计 ---
+
+
+@app.get("/sessions/{session_id}/tokens")
+async def get_session_tokens(session_id: str, user_id: int = Query(...)):
+    """获取会话累计 token 用量（需验证所有权）"""
+    try:
+        await _session_manager.verify_ownership(session_id, user_id)
+        tokens = await _session_manager.get_session_tokens(session_id)
+        return tokens
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("获取 token 统计失败")
+        raise HTTPException(status_code=500, detail="获取 token 统计失败")
+
+
+# --- 对话搜索 ---
+
+
+@app.get("/search")
+async def search_messages(user_id: int = Query(...), keyword: str = Query(...)):
+    """搜索当前用户所有会话中的消息"""
+    try:
+        results = await _session_manager.search_messages(user_id, keyword)
+        return {"results": results}
+    except Exception:
+        logger.exception("搜索消息失败")
+        raise HTTPException(status_code=500, detail="搜索失败")
+
+
 # =============================================================================
 # 启动入口
 # =============================================================================

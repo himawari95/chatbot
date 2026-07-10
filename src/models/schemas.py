@@ -103,6 +103,9 @@ class SessionInfo(BaseModel):
     title: str
     role: str = "default"
     user_id: Optional[int] = None
+    total_prompt_tokens: int = 0
+    total_completion_tokens: int = 0
+    total_tokens: int = 0
     created_at: str = ""
     updated_at: str = ""
 
@@ -151,3 +154,23 @@ class SessionListResponse(BaseModel):
 class MessageListResponse(BaseModel):
     """消息列表响应"""
     messages: list[MessageInfo]
+
+
+class TokenInfo(BaseModel):
+    """Token 用量信息"""
+    total_prompt_tokens: int = 0
+    total_completion_tokens: int = 0
+    total_tokens: int = 0
+
+
+class SearchResultItem(BaseModel):
+    """搜索结果项"""
+    session_id: str
+    session_title: str
+    content: str
+    timestamp: str
+
+
+class SearchResponse(BaseModel):
+    """搜索响应"""
+    results: list[SearchResultItem]

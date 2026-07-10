@@ -97,14 +97,38 @@ class StorageBackend(ABC):
 
     @abstractmethod
     async def save_message(
-        self, session_id: str, role: str, content: str, role_name: str = "default"
+        self, session_id: str, role: str, content: str, role_name: str = "default",
+        prompt_tokens: int = 0, completion_tokens: int = 0, total_tokens: int = 0,
     ) -> None:
-        """保存一条消息并更新会话的更新时间"""
+        """保存一条消息并更新会话的更新时间，可附带 token 用量"""
         ...
 
     @abstractmethod
     async def auto_title(self, session_id: str, message: str) -> None:
         """若会话尚无标题，则取用户消息前20字符作为自动标题"""
+        ...
+
+    # ------------------------------------------------------------------
+    # Token 统计
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    async def get_session_tokens(self, session_id: str) -> dict:
+        """获取会话累计 token 用量"""
+        ...
+
+    @abstractmethod
+    async def update_session_tokens(self, session_id: str) -> None:
+        """重新计算并更新会话的 token 累计值"""
+        ...
+
+    # ------------------------------------------------------------------
+    # 搜索
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    async def search_messages(self, user_id: int, keyword: str) -> list[dict]:
+        """搜索用户所有会话中的消息，按关键词匹配"""
         ...
 
     # ------------------------------------------------------------------
