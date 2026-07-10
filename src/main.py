@@ -22,6 +22,7 @@ from src.models.schemas import (
     ChatRequest,
     ChatResponse,
     LoginRequest,
+    ParallelChatRequest,
     PresetCreateRequest,
     PresetUpdateRequest,
     RenameRequest,
@@ -293,6 +294,38 @@ async def chat_stream(req: ChatRequest):
             user_id=req.user_id,
             role=req.role,
             model=req.model,
+        ):
+            yield event
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# --- 并行多模型聊天（SSE） ---
+
+
+@app.post("/chat/parallel")
+async def chat_parallel(req: ParallelChatRequest):
+    """并行调用多个模型，以 SSE 格式流式返回对比结果"""
+    if len(req.models) < 2:
+        raise HTTPException(status_code=400, detail="至少需要选择 2 个模型")
+    if not await _validate_role(req.role, req.user_id):
+        raise HTTPException(status_code=400, detail=f"未知角色: {req.role}")
+
+    async def event_stream():
+        async for event in _chat_engine.parallel_chat_stream(
+            message=req.message,
+            model_names=req.models,
+            session_id=req.session_id,
+            user_id=req.user_id,
+            role=req.role,
         ):
             yield event
 

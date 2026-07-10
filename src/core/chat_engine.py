@@ -257,6 +257,109 @@ class ChatEngine:
             yield f"data: {json.dumps({'error': '服务器内部错误'})}\n\n"
 
     # ------------------------------------------------------------------
+    # 多模型并行对比
+    # ------------------------------------------------------------------
+
+    async def parallel_chat_stream(
+        self,
+        message: str,
+        model_names: list[str],
+        session_id: str,
+        user_id: int,
+        role: str = "default",
+    ) -> AsyncGenerator[str, None]:
+        """并行调用多个模型，流式输出对比结果。
+
+        每个模型的 token 以 SSE 格式产出，包含 model 标签。
+        所有模型结束后发送 all_done 事件。
+        """
+        try:
+            await self._sessions.verify_ownership(session_id, user_id)
+
+            # 解析 system prompt
+            if self._presets.exists(role):
+                system_prompt = self._presets.get_system_prompt(role)
+            elif self._storage:
+                preset = await self._storage.get_preset_by_name(role, user_id)
+                system_prompt = preset["system_prompt"] if preset else self._presets.get_system_prompt("default")
+            else:
+                system_prompt = self._presets.get_system_prompt("default")
+
+            # 加载对话历史
+            memory = await self._sessions.load_memory(session_id, role)
+            messages = [SystemMessage(content=system_prompt)]
+            messages.extend(memory.chat_memory.messages)
+            messages.append(HumanMessage(content=message))
+
+            # 保存用户消息（只保存一次）
+            await self._sessions.save_message(session_id, "user", message, role)
+
+            # 使用 Queue 合并多个并行流
+            queue: asyncio.Queue = asyncio.Queue()
+            total = len(model_names)
+
+            async def _stream_one_model(model_name: str) -> None:
+                """单个模型的流式调用"""
+                try:
+                    llm = self.build_llm(model_name)
+                    t_start = time.monotonic()
+                    full_response = ""
+                    async for event in self._stream_with_retry(
+                        llm, messages, user_id, session_id, model_name,
+                    ):
+                        if event["type"] == "token":
+                            full_response += event["content"]
+                            await queue.put({
+                                "model": model_name,
+                                "content": event["content"],
+                            })
+                    duration = round(time.monotonic() - t_start, 2)
+                    await queue.put({
+                        "model": model_name,
+                        "done": True,
+                        "response": full_response,
+                        "duration": duration,
+                    })
+                    # 保存助手消息
+                    await self._sessions.save_message(
+                        session_id, "assistant", full_response, model_name,
+                    )
+                    logger.info(
+                        "并行LLM调用成功",
+                        extra={"user_id": user_id, "session_id": session_id,
+                               "model": model_name, "duration": duration},
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"并行LLM调用失败: {e}",
+                        extra={"user_id": user_id, "session_id": session_id, "model": model_name},
+                    )
+                    await queue.put({
+                        "model": model_name,
+                        "error": str(e),
+                        "done": True,
+                    })
+
+            # 启动所有并行任务
+            tasks = [asyncio.create_task(_stream_one_model(m)) for m in model_names]
+
+            # 从队列读取事件，直到所有模型完成
+            done_count = 0
+            while done_count < total:
+                event = await queue.get()
+                if event.get("done"):
+                    done_count += 1
+                yield "data: " + json.dumps(event, ensure_ascii=False) + "\n\n"
+
+            yield "data: " + json.dumps({"all_done": True}) + "\n\n"
+
+        except asyncio.CancelledError:
+            logger.info("并行SSE流被客户端取消")
+        except Exception:
+            logger.exception("并行聊天出错")
+            yield f"data: {json.dumps({'error': '服务器内部错误'})}\n\n"
+
+    # ------------------------------------------------------------------
     # 可用模型列表
     # ------------------------------------------------------------------
 

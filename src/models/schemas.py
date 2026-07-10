@@ -63,6 +63,15 @@ class PresetUpdateRequest(BaseModel):
     system_prompt: str | None = None
 
 
+class ParallelChatRequest(BaseModel):
+    """并行多模型聊天请求"""
+    message: str
+    session_id: str
+    user_id: int
+    models: list[str]      # 至少 2 个模型名称
+    role: str = "default"
+
+
 # =============================================================================
 # 响应模型（API 出参）
 # =============================================================================

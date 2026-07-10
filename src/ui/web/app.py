@@ -265,6 +265,38 @@ async def _fetch_session_tokens(session_id: str, user_id: int) -> dict:
     return {"total_prompt_tokens": 0, "total_completion_tokens": 0, "total_tokens": 0}
 
 
+async def _parallel_stream_tokens(
+    message: str, session_id: str, models: list[str], user_id: int, role: str,
+) -> AsyncGenerator[dict, None]:
+    """连接后端并行 SSE 端点，逐模型产出事件"""
+    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0)) as c:
+        async with c.stream(
+            "POST",
+            f"{BACKEND_URL}/chat/parallel",
+            json={
+                "message": message,
+                "session_id": session_id,
+                "models": models,
+                "user_id": user_id,
+                "role": role,
+            },
+        ) as resp:
+            if resp.status_code != 200:
+                text = await resp.aread()
+                raise RuntimeError(f"后端返回 {resp.status_code}: {text[:200]}")
+
+            async for line in resp.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                try:
+                    payload = json.loads(line[6:])
+                except json.JSONDecodeError:
+                    continue
+                if "error" in payload and "all_done" not in payload and "model" not in payload:
+                    raise RuntimeError(payload["error"])
+                yield payload
+
+
 async def _export_session_api(session_id: str, user_id: int) -> dict | None:
     """调用后端导出会话"""
     try:
@@ -935,6 +967,91 @@ async def export_current_session(session_id: str, user_id: int) -> str:
     return f"### ✅ 已导出到桌面 chatbot_exports 文件夹\n> {filepath}"
 
 
+async def parallel_chat_respond(
+    message: str, models: list[str], session_id: str, user_id: int, role: str,
+):
+    """并行多模型聊天处理器 — 逐模型流式输出"""
+    empty = (gr.update(visible=False, value=""),) * 4
+    if not message.strip():
+        yield (*empty, gr.update())
+        return
+    if not user_id:
+        yield (*empty, gr.update())
+        return
+    if len(models) < 2:
+        yield (*empty, gr.update())
+        return
+    if not session_id:
+        session = await _create_session_api(user_id, role, models[0])
+        if not session:
+            yield (*empty, gr.update())
+            return
+        session_id = session["id"]
+
+    # 每个模型对应一个响应缓冲区
+    model_names = models[:4]  # 最多 4 个
+    buffers: dict[str, str] = {m: "" for m in model_names}
+    durations: dict[str, str] = {}
+    errors: dict[str, str] = {}
+    done_models: set = set()
+
+    def _render() -> tuple:
+        """渲染各模型的当前状态为 4 个 Markdown"""
+        results = []
+        for m in model_names:
+            if m in errors:
+                results.append(gr.update(
+                    visible=True,
+                    value=f"### ❌ {m}\n> 错误：{errors[m]}",
+                ))
+            elif m in done_models:
+                d = durations.get(m, "?")
+                results.append(gr.update(
+                    visible=True,
+                    value=f"### ✅ {m}（{d}s）\n{buffers[m]}",
+                ))
+            else:
+                results.append(gr.update(
+                    visible=True,
+                    value=f"### ⏳ {m}\n{buffers[m]}",
+                ))
+        # 补齐到 4 个
+        while len(results) < 4:
+            results.append(gr.update(visible=False, value=""))
+        return tuple(results)
+
+    # 初始渲染
+    yield (*_render(), gr.update(interactive=False))
+
+    try:
+        async for event in _parallel_stream_tokens(message, session_id, model_names, user_id, role):
+            if "all_done" in event:
+                break
+            model = event.get("model", "")
+            if model not in model_names:
+                continue
+            if "content" in event:
+                buffers[model] += event["content"]
+                yield (*_render(), gr.update(interactive=False))
+            elif event.get("done"):
+                done_models.add(model)
+                if "duration" in event:
+                    durations[model] = str(event["duration"])
+                if "error" in event:
+                    errors[model] = event["error"]
+                yield (*_render(), gr.update(interactive=False))
+
+    except Exception as e:
+        for m in model_names:
+            if m not in done_models and m not in errors:
+                errors[m] = str(e)
+                done_models.add(m)
+        yield (*_render(), gr.update(interactive=True))
+        return
+
+    yield (*_render(), gr.update(interactive=True))
+
+
 def on_startup():
     """页面加载时的初始化回调"""
 
@@ -943,6 +1060,7 @@ def on_startup():
         return (
             status,
             gr.update(choices=models, value=models[0] if models else "deepseek-chat"),
+            gr.update(choices=models, value=[]),
         )
 
     return asyncio.run(_init())
@@ -1024,6 +1142,29 @@ def build_ui() -> gr.Blocks:
 
         # --- 导出状态 ---
         export_status_md = gr.Markdown("")
+
+        # --- 并行多模型对比 ---
+        with gr.Accordion("🔀 多模型并行对比", open=False):
+            with gr.Row(equal_height=True):
+                parallel_models_cbg = gr.CheckboxGroup(
+                    label="选择模型（至少 2 个）",
+                    choices=["deepseek-chat"],
+                    value=[],
+                    scale=4,
+                )
+                parallel_send_btn = gr.Button("🚀 并行发送", scale=1, variant="primary", size="sm")
+            parallel_msg_box = gr.Textbox(
+                placeholder="输入消息，Enter 发送到所有选中模型...",
+                label="并行提问",
+                container=False,
+            )
+            # 4 个模型输出区域（2x2 网格）
+            with gr.Row(equal_height=False):
+                parallel_md1 = gr.Markdown("", visible=False)
+                parallel_md2 = gr.Markdown("", visible=False)
+            with gr.Row(equal_height=False):
+                parallel_md3 = gr.Markdown("", visible=False)
+                parallel_md4 = gr.Markdown("", visible=False)
 
         # --- 预设管理按钮 ---
         with gr.Row(equal_height=True):
@@ -1264,6 +1405,20 @@ def build_ui() -> gr.Blocks:
             outputs=[export_status_md],
         )
 
+        # --- 并行聊天事件 ---
+
+        parallel_send_btn.click(
+            parallel_chat_respond,
+            inputs=[parallel_msg_box, parallel_models_cbg, session_state, user_state, role_state],
+            outputs=[parallel_md1, parallel_md2, parallel_md3, parallel_md4, parallel_send_btn],
+        )
+
+        parallel_msg_box.submit(
+            parallel_chat_respond,
+            inputs=[parallel_msg_box, parallel_models_cbg, session_state, user_state, role_state],
+            outputs=[parallel_md1, parallel_md2, parallel_md3, parallel_md4, parallel_send_btn],
+        )
+
         # --- 搜索事件 ---
 
         search_btn.click(
@@ -1274,7 +1429,7 @@ def build_ui() -> gr.Blocks:
 
         demo.load(
             on_startup,
-            outputs=[status_md, model_dd],
+            outputs=[status_md, model_dd, parallel_models_cbg],
         )
 
     return demo
