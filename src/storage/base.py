@@ -104,6 +104,11 @@ class StorageBackend(ABC):
         ...
 
     @abstractmethod
+    async def get_all_messages(self, session_id: str) -> list[dict]:
+        """获取某个会话的所有消息（不区分角色，按时间升序）"""
+        ...
+
+    @abstractmethod
     async def auto_title(self, session_id: str, message: str) -> None:
         """若会话尚无标题，则取用户消息前20字符作为自动标题"""
         ...

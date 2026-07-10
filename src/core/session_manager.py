@@ -5,6 +5,10 @@
 """
 
 import logging
+import os
+import re
+from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 from langchain_classic.memory import ConversationBufferMemory
@@ -67,7 +71,12 @@ class SessionManager:
         import uuid
         sid = session_id or uuid.uuid4().hex[:8]
         await self._storage.create_session(sid, user_id, role=role, model_name=model_name)
-        return await self._storage.get_session(sid)
+        session = await self._storage.get_session(sid)
+        logger.info(
+            "会话创建", extra={"user_id": user_id, "session_id": sid,
+                            "operation": "create_session", "role": role, "model": model_name},
+        )
+        return session
 
     async def delete_session(self, session_id: str, user_id: int) -> None:
         """删除会话（需验证所有权）并清理所有关联的内存缓存"""
@@ -77,6 +86,10 @@ class SessionManager:
         for key in list(self._memory_cache.keys()):
             if key.startswith(f"{session_id}:"):
                 del self._memory_cache[key]
+        logger.info(
+            "会话删除", extra={"user_id": user_id, "session_id": session_id,
+                            "operation": "delete_session"},
+        )
 
     async def rename_session(self, session_id: str, title: str, user_id: int) -> dict:
         """重命名会话（需验证所有权）"""
@@ -154,6 +167,63 @@ class SessionManager:
         if not keyword.strip():
             return []
         return await self._storage.search_messages(user_id, keyword.strip())
+
+    # ------------------------------------------------------------------
+    # 导出
+    # ------------------------------------------------------------------
+
+    async def export_session(self, session_id: str, user_id: int) -> str:
+        """导出会话为 Markdown 文件，返回文件路径"""
+        # 验证所有权
+        session = await self._verify_ownership(session_id, user_id)
+
+        # 获取所有消息
+        messages = await self._storage.get_all_messages(session_id)
+
+        # 生成 Markdown 内容
+        title = session.get("title") or session_id
+        export_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        model = session.get("model_name", "deepseek-chat")
+        role = session.get("role", "default")
+
+        lines = [
+            f"# {title}",
+            "",
+            f"**导出时间**：{export_time}",
+            f"**模型**：{model}",
+            f"**角色**：{role}",
+            "",
+            "---",
+            "",
+        ]
+        for msg in messages:
+            if msg["role"] == "user":
+                lines.append("## 用户")
+            else:
+                lines.append("## 助手")
+            lines.append("")
+            lines.append(msg["content"])
+            lines.append("")
+
+        content = "\n".join(lines)
+
+        # 确定导出路径
+        export_dir = Path(os.path.expanduser("~/Desktop/chatbot_exports"))
+        export_dir.mkdir(parents=True, exist_ok=True)
+
+        # 生成文件名：替换 Windows 非法字符，保留空格、中文等
+        safe_title = re.sub(r'[\\/:*?"<>|]', "_", title)
+        filename = f"{safe_title}_{export_time[:10]}.md"
+        filepath = export_dir / filename
+
+        # 写入文件
+        filepath.write_text(content, encoding="utf-8")
+
+        logger.info(
+            "会话导出", extra={"user_id": user_id, "session_id": session_id,
+                            "operation": "export_session", "filepath": str(filepath)},
+        )
+        return str(filepath)
 
     async def load_memory(
         self, session_id: str, role_name: str

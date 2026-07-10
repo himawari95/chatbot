@@ -5,6 +5,7 @@ Chatbot 前端 — Gradio Web UI
 
 import asyncio
 import json
+import logging
 from typing import AsyncGenerator
 
 import gradio as gr
@@ -19,6 +20,8 @@ from src.interface.ui_protocol import BackendConfig, BOT_AVATAR, USER_AVATAR
 
 _backend = BackendConfig()
 BACKEND_URL = _backend.base_url
+
+logger = logging.getLogger("chatbot")
 
 # 从预设管理器加载角色选项
 _presets = get_preset_manager()
@@ -262,6 +265,22 @@ async def _fetch_session_tokens(session_id: str, user_id: int) -> dict:
     return {"total_prompt_tokens": 0, "total_completion_tokens": 0, "total_tokens": 0}
 
 
+async def _export_session_api(session_id: str, user_id: int) -> dict | None:
+    """调用后端导出会话"""
+    try:
+        async with httpx.AsyncClient() as c:
+            r = await c.post(
+                f"{BACKEND_URL}/sessions/{session_id}/export",
+                params={"user_id": user_id},
+                timeout=10.0,
+            )
+            if r.status_code == 200:
+                return r.json()
+    except Exception:
+        pass
+    return None
+
+
 async def _search_messages_api(user_id: int, keyword: str) -> list[dict]:
     """搜索用户消息"""
     try:
@@ -416,6 +435,7 @@ async def login(username: str) -> tuple:
 
     user_id = user["id"]
     username_val = user["username"]
+    logger.info("UI 用户登录", extra={"user_id": user_id, "username": username_val, "operation": "ui_login"})
     choices, default_id = await _build_dropdown(user_id)
     role_choices = await _refresh_role_choices(user_id)
 
@@ -479,6 +499,7 @@ async def delete_user(
 
     # 第二次点击：执行删除
     success = await _delete_user_api(user_id)
+    logger.info("UI 用户删除", extra={"user_id": user_id, "operation": "ui_delete_user", "success": success})
     if success:
         return (
             None, "", "### ⚠️ 用户已删除，请重新登录",
@@ -899,6 +920,21 @@ async def search_messages(user_id: int, keyword: str) -> str:
     return "\n".join(lines)
 
 
+async def export_current_session(session_id: str, user_id: int) -> str:
+    """导出当前会话到桌面"""
+    if not user_id:
+        return "### ⚠️ 请先登录后再导出"
+    if not session_id:
+        return "### ⚠️ 请先选择或创建会话"
+    result = await _export_session_api(session_id, user_id)
+    if not result:
+        logger.warning("UI 导出失败", extra={"user_id": user_id, "session_id": session_id, "operation": "ui_export"})
+        return "### 🔴 导出失败 — 请检查后端是否正常"
+    filepath = result.get("filepath", "")
+    logger.info("UI 导出成功", extra={"user_id": user_id, "session_id": session_id, "operation": "ui_export", "filepath": filepath})
+    return f"### ✅ 已导出到桌面 chatbot_exports 文件夹\n> {filepath}"
+
+
 def on_startup():
     """页面加载时的初始化回调"""
 
@@ -972,6 +1008,7 @@ def build_ui() -> gr.Blocks:
                 interactive=True,
             )
             new_btn = gr.Button("＋ 新会话", scale=1, variant="secondary", size="sm")
+            export_btn = gr.Button("📥 导出", scale=1, variant="secondary", size="sm")
             del_btn = gr.Button("🗑", scale=0, variant="stop", size="sm", min_width=40)
             cancel_del_btn = gr.Button("取消", scale=0, variant="secondary", size="sm", visible=False)
 
@@ -984,6 +1021,9 @@ def build_ui() -> gr.Blocks:
                 container=False,
             )
             rename_btn = gr.Button("✏️ 重命名", scale=1, variant="secondary", size="sm")
+
+        # --- 导出状态 ---
+        export_status_md = gr.Markdown("")
 
         # --- 预设管理按钮 ---
         with gr.Row(equal_height=True):
@@ -1214,6 +1254,14 @@ def build_ui() -> gr.Blocks:
                 preset_edit_mode, preset_edit_id, preset_add_btn,
                 preset_delete_pending, preset_del_confirm_btn,
             ],
+        )
+
+        # --- 导出事件 ---
+
+        export_btn.click(
+            export_current_session,
+            inputs=[session_state, user_state],
+            outputs=[export_status_md],
         )
 
         # --- 搜索事件 ---

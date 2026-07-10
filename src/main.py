@@ -57,14 +57,16 @@ _chat_engine = ChatEngine(_session_manager, _presets, _config, _storage)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """应用生命周期：启动时初始化数据库，关闭时释放资源"""
+    """应用生命周期：启动时初始化日志、数据库，关闭时释放资源"""
+    _config.init_logging()
+    logger.info("应用启动", extra={"operation": "startup"})
     logger.info("正在初始化数据库...")
     await _storage.initialize()
     logger.info("数据库初始化完成")
     yield
     logger.info("正在关闭数据库连接...")
     await _storage.close()
-    logger.info("数据库连接已关闭")
+    logger.info("应用关闭", extra={"operation": "shutdown"})
 
 
 # =============================================================================
@@ -245,7 +247,7 @@ async def delete_user(user_id: int):
         await _user_manager.delete_user(user_id)
         return {"ok": True}
     except Exception:
-        logger.exception("删除用户失败")
+        logger.exception("删除用户失败", extra={"user_id": user_id})
         raise HTTPException(status_code=500, detail="删除用户失败")
 
 
@@ -271,7 +273,7 @@ async def chat(req: ChatRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception:
-        logger.exception("聊天请求处理出错")
+        logger.exception("聊天请求处理出错", extra={"user_id": req.user_id, "session_id": req.session_id, "model": req.model})
         raise HTTPException(status_code=500, detail="服务器内部错误")
 
 
@@ -402,6 +404,22 @@ async def search_messages(user_id: int = Query(...), keyword: str = Query(...)):
     except Exception:
         logger.exception("搜索消息失败")
         raise HTTPException(status_code=500, detail="搜索失败")
+
+
+# --- 对话导出 ---
+
+
+@app.post("/sessions/{session_id}/export")
+async def export_session(session_id: str, user_id: int = Query(...)):
+    """导出会话为 Markdown 文件（需验证所有权）"""
+    try:
+        filepath = await _session_manager.export_session(session_id, user_id)
+        return {"ok": True, "filepath": filepath}
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("导出会话失败", extra={"user_id": user_id, "session_id": session_id})
+        raise HTTPException(status_code=500, detail="导出失败")
 
 
 # =============================================================================

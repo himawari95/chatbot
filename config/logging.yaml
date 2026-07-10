@@ -1,36 +1,38 @@
 # =============================================================================
-# 日志配置
+# Chatbot 日志配置（简化格式，由 ConfigManager 程序化加载）
 # =============================================================================
 
-version: 1
-disable_existing_loggers: false
+# 全局日志级别（DEBUG / INFO / WARNING / ERROR）
+level: "INFO"
 
-formatters:
-  default:
-    format: "[%(asctime)s] %(levelname)s | %(name)s | %(message)s"
-    datefmt: "%Y-%m-%d %H:%M:%S"
-  simple:
-    format: "%(levelname)s | %(message)s"
-
-handlers:
+# 输出目标
+outputs:
+  # 控制台输出
   console:
-    class: "logging.StreamHandler"
+    enabled: true
     level: "INFO"
-    formatter: "simple"
-    stream: "ext://sys.stdout"
+
+  # 文件输出（按天滚动，保留 7 天）
   file:
-    class: "logging.FileHandler"
+    enabled: true
     level: "DEBUG"
-    formatter: "default"
-    filename: "logs/chatbot.log"
+    path: "logs/app.log"
+    when: "midnight"      # 滚动时机：midnight / H / D
+    backup_count: 7       # 保留天数
     encoding: "utf-8"
 
-loggers:
-  chatbot:
-    level: "DEBUG"
-    handlers: ["console", "file"]
-    propagate: false
-  uvicorn:
-    level: "INFO"
-    handlers: ["console"]
-    propagate: false
+# JSON 格式开关
+json_format: true
+
+# 第三方库日志抑制（减少噪音）
+quiet_libs:
+  - "httpx"
+  - "httpcore"
+  - "openai"
+  - "urllib3"
+  - "asyncio"
+  - "aiosqlite"
+  - "sqlalchemy"
+  - "langchain_classic"
+  - "langchain_core"
+  - "langchain_openai"

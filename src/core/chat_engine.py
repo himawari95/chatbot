@@ -7,6 +7,7 @@
 import asyncio
 import json
 import logging
+import time
 from typing import AsyncGenerator, Optional
 
 from langchain_classic.chains import ConversationChain
@@ -41,17 +42,7 @@ class ChatEngine:
     # ------------------------------------------------------------------
 
     def build_llm(self, model_name: Optional[str] = None) -> ChatOpenAI:
-        """根据模型名称构建 ChatOpenAI 实例
-
-        参数:
-            model_name: 模型名称，为 None 时使用默认模型
-
-        返回:
-            配置好的 ChatOpenAI 实例
-
-        异常:
-            ValueError: 如果模型未在注册表中配置或 API Key 未设置
-        """
+        """根据模型名称构建 ChatOpenAI 实例"""
         name = model_name or self._config.default_model
         cfg = self._config.get_model_config(name)
         if not cfg:
@@ -72,6 +63,86 @@ class ChatEngine:
         )
 
     # ------------------------------------------------------------------
+    # 带超时和重试的 LLM 流式调用
+    # ------------------------------------------------------------------
+
+    async def _stream_with_retry(
+        self, llm: ChatOpenAI, messages: list, user_id: int, session_id: str, model_name: str,
+    ) -> AsyncGenerator[dict, None]:
+        """流式调用 LLM，支持超时和指数退避重试。
+
+        Yields:
+            dict: {"type": "token", "content": str} 或 {"type": "usage", "data": dict}
+        """
+        timeout_sec = self._config.llm_timeout
+        max_retries = self._config.llm_max_retries
+        backoff = self._config.llm_retry_backoff
+
+        last_error = None
+        for attempt in range(max_retries + 1):
+            try:
+                t_start = time.monotonic()
+                usage: dict[str, int] = {}
+
+                async with asyncio.timeout(timeout_sec):
+                    async for chunk in llm.astream(messages):
+                        content = chunk.content
+                        if isinstance(content, str) and content:
+                            yield {"type": "token", "content": content}
+                        if hasattr(chunk, "usage_metadata") and chunk.usage_metadata:
+                            um = chunk.usage_metadata
+                            usage = {
+                                "prompt_tokens": um.get("input_tokens", 0),
+                                "completion_tokens": um.get("output_tokens", 0),
+                                "total_tokens": um.get("total_tokens", 0),
+                            }
+
+                duration = round(time.monotonic() - t_start, 2)
+                logger.info(
+                    "LLM 调用成功",
+                    extra={"user_id": user_id, "session_id": session_id,
+                           "model": model_name, "duration": duration, "attempt": attempt + 1},
+                )
+                if usage:
+                    yield {"type": "usage", "data": usage}
+                return
+
+            except asyncio.TimeoutError:
+                last_error = f"超时（{timeout_sec}s）"
+                if attempt < max_retries:
+                    wait = backoff ** attempt
+                    logger.warning(
+                        f"LLM 调用超时，{wait}s 后重试",
+                        extra={"user_id": user_id, "session_id": session_id,
+                               "model": model_name, "attempt": attempt + 1, "retry_wait": wait},
+                    )
+                    await asyncio.sleep(wait)
+                else:
+                    logger.error(
+                        f"LLM 调用超时，已达最大重试次数",
+                        extra={"user_id": user_id, "session_id": session_id,
+                               "model": model_name, "max_retries": max_retries},
+                    )
+
+            except Exception as e:
+                last_error = str(e)
+                if attempt < max_retries:
+                    wait = backoff ** attempt
+                    logger.warning(
+                        f"LLM 调用失败，{wait}s 后重试: {e}",
+                        extra={"user_id": user_id, "session_id": session_id,
+                               "model": model_name, "attempt": attempt + 1, "retry_wait": wait},
+                    )
+                    await asyncio.sleep(wait)
+                else:
+                    logger.error(
+                        f"LLM 调用失败，已达最大重试次数: {e}",
+                        extra={"user_id": user_id, "session_id": session_id, "model": model_name},
+                    )
+
+        raise RuntimeError(f"LLM 调用失败: {last_error}")
+
+    # ------------------------------------------------------------------
     # 非流式聊天
     # ------------------------------------------------------------------
 
@@ -83,11 +154,7 @@ class ChatEngine:
         role: str = "default",
         model: Optional[str] = None,
     ) -> dict:
-        """发送消息并返回完整 AI 回复（非流式）
-
-        返回:
-            {"response": str, "session_id": str}
-        """
+        """发送消息并返回完整 AI 回复（非流式）"""
         await self._sessions.verify_ownership(session_id, user_id)
         await self._sessions.load_memory(session_id, role)
 
@@ -118,11 +185,7 @@ class ChatEngine:
         role: str = "default",
         model: Optional[str] = None,
     ) -> AsyncGenerator[str, None]:
-        """发送消息并以 SSE 格式流式返回 AI 回复
-
-        生成:
-            SSE 格式的事件字符串（"data: {...}\n\n"）
-        """
+        """发送消息并以 SSE 格式流式返回 AI 回复（支持超时和重试）"""
         try:
             await self._sessions.verify_ownership(session_id, user_id)
 
@@ -154,29 +217,22 @@ class ChatEngine:
             # 保存用户消息
             await self._sessions.save_message(session_id, "user", message, role)
 
-            # 流式生成，同时收集 token 用量
+            # 流式生成（带超时和重试）
             full_response: str = ""
             usage: dict[str, int] = {}
-            async for chunk in llm.astream(messages):
-                content = chunk.content
-                if isinstance(content, str) and content:
-                    full_response += content
+            async for event in self._stream_with_retry(llm, messages, user_id, session_id, model_name):
+                if event["type"] == "token":
+                    full_response += event["content"]
                     yield (
                         "data: "
                         + json.dumps(
-                            {"content": content, "session_id": session_id},
+                            {"content": event["content"], "session_id": session_id},
                             ensure_ascii=False,
                         )
                         + "\n\n"
                     )
-                # 从最后一个 chunk 提取 token 用量
-                if hasattr(chunk, "usage_metadata") and chunk.usage_metadata:
-                    um = chunk.usage_metadata
-                    usage = {
-                        "prompt_tokens": um.get("input_tokens", 0),
-                        "completion_tokens": um.get("output_tokens", 0),
-                        "total_tokens": um.get("total_tokens", 0),
-                    }
+                elif event["type"] == "usage":
+                    usage = event["data"]
 
             # 保存完整回复（含 token 用量）并更新会话统计
             self._sessions.save_context(session_id, role, message, full_response)

@@ -131,6 +131,7 @@ class SQLiteBackend(StorageBackend):
                 async with self._engine.connect() as conn:
                     await conn.get_raw_connection()
             except Exception:
+                logger.warning("数据库文件损坏，正在重建", extra={"operation": "db_init", "db_path": str(self._db_path)})
                 self._db_path.unlink(missing_ok=True)
 
         # 迁移：检查是否需要重建或添加列（使用同一个同步连接完成所有操作）
@@ -363,6 +364,20 @@ class SQLiteBackend(StorageBackend):
             )
             rows = result.scalars().all()
         return [{"role": r.role, "content": r.content} for r in rows]
+
+    async def get_all_messages(self, session_id: str) -> list[dict]:
+        """获取某会话的所有消息（不区分角色，按时间升序）"""
+        async with self._session_factory() as db:
+            result = await db.execute(
+                select(MessageModel)
+                .where(MessageModel.session_id == session_id)
+                .order_by(MessageModel.timestamp.asc())
+            )
+            rows = result.scalars().all()
+        return [
+            {"role": r.role, "content": r.content, "timestamp": str(r.timestamp)}
+            for r in rows
+        ]
 
     async def save_message(
         self, session_id: str, role: str, content: str, role_name: str = "default",

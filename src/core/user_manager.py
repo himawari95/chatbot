@@ -17,33 +17,24 @@ class UserManager:
         self._storage = storage
 
     async def login(self, username: str) -> dict:
-        """用户登录（获取或创建）
-
-        参数:
-            username: 用户名（去除前后空白后非空）
-
-        返回:
-            包含 id, username, created_at 的用户字典
-
-        异常:
-            ValueError: 如果用户名为空
-        """
+        """用户登录（获取或创建）"""
         username = username.strip()
         if not username:
             raise ValueError("用户名不能为空")
-        return await self._storage.get_or_create_user(username)
+        user = await self._storage.get_or_create_user(username)
+        logger.info(
+            "用户登录", extra={"user_id": user["id"], "username": username,
+                            "operation": "login", "created_at": user["created_at"]},
+        )
+        return user
 
     async def get_user(self, username: str) -> dict | None:
         """根据用户名查找用户"""
         return await self._storage.get_user(username.strip())
 
     async def delete_user(self, user_id: int) -> None:
-        """删除用户及其关联的所有数据
-
-        参数:
-            user_id: 要删除的用户 ID
-
-        异常:
-            ValueError: 如果用户 ID 无效
-        """
+        """删除用户及其关联的所有数据"""
         await self._storage.delete_user(user_id)
+        logger.info(
+            "用户删除", extra={"user_id": user_id, "operation": "delete_user"},
+        )
