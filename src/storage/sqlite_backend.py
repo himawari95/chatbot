@@ -54,6 +54,7 @@ class SessionModel(Base):
     id = Column(String(32), primary_key=True)
     title = Column(String(200), default="")
     role = Column(String(20), default="default", server_default="default")
+    model_name = Column(String(50), default="deepseek-chat", server_default="deepseek-chat")
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
@@ -61,6 +62,20 @@ class SessionModel(Base):
     messages = relationship(
         "MessageModel", back_populates="session", cascade="all, delete-orphan"
     )
+
+
+class PresetModel(Base):
+    """预设表 — 用户自定义角色预设"""
+    __tablename__ = "presets"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    name = Column(String(50), nullable=False)
+    description = Column(String(200), default="")
+    system_prompt = Column(Text, nullable=False)
+    is_builtin = Column(Integer, default=0)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
 
 class MessageModel(Base):
@@ -112,7 +127,7 @@ class SQLiteBackend(StorageBackend):
             except Exception:
                 self._db_path.unlink(missing_ok=True)
 
-        # 迁移：检查是否需要重建或添加列
+        # 迁移：检查是否需要重建或添加列（使用同一个同步连接完成所有操作）
         if self._db_path.exists():
             import sqlite3 as _sync_sqlite
             conn = _sync_sqlite.connect(str(self._db_path))
@@ -127,26 +142,45 @@ class SQLiteBackend(StorageBackend):
             else:
                 # 为 sessions 表添加 role 列（如果缺少）
                 cols = [r[1] for r in conn.execute("PRAGMA table_info('sessions')").fetchall()]
-                conn.close()
                 if "role" not in cols:
                     logger.info("为 sessions 表添加 'role' 列")
-                    c2 = _sync_sqlite.connect(str(self._db_path))
-                    c2.execute("ALTER TABLE sessions ADD COLUMN role VARCHAR(20) DEFAULT 'default'")
-                    c2.commit()
-                    c2.close()
+                    conn.execute("ALTER TABLE sessions ADD COLUMN role VARCHAR(20) DEFAULT 'default'")
 
                 # 为 messages 表添加 role_name 列（如果缺少）
-                c2 = _sync_sqlite.connect(str(self._db_path))
-                msg_cols = [r[1] for r in c2.execute("PRAGMA table_info('messages')").fetchall()]
-                c2.close()
+                msg_cols = [r[1] for r in conn.execute("PRAGMA table_info('messages')").fetchall()]
                 if "role_name" not in msg_cols:
                     logger.info("为 messages 表添加 'role_name' 列")
-                    c3 = _sync_sqlite.connect(str(self._db_path))
-                    c3.execute("ALTER TABLE messages ADD COLUMN role_name VARCHAR(20) DEFAULT 'default'")
-                    c3.commit()
-                    c3.close()
+                    conn.execute("ALTER TABLE messages ADD COLUMN role_name VARCHAR(20) DEFAULT 'default'")
 
-        # 创建所有表
+                # 为 sessions 表添加 model_name 列（如果缺少）
+                sess_cols = [r[1] for r in conn.execute("PRAGMA table_info('sessions')").fetchall()]
+                if "model_name" not in sess_cols:
+                    logger.info("为 sessions 表添加 'model_name' 列")
+                    conn.execute("ALTER TABLE sessions ADD COLUMN model_name VARCHAR(50) DEFAULT 'deepseek-chat'")
+
+                # 检查并创建 presets 表
+                preset_tables = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='presets'"
+                ).fetchall()
+                if not preset_tables:
+                    logger.info("创建 presets 表...")
+                    conn.execute("""
+                        CREATE TABLE presets (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                            name VARCHAR(50) NOT NULL,
+                            description VARCHAR(200) DEFAULT '',
+                            system_prompt TEXT NOT NULL,
+                            is_builtin INTEGER DEFAULT 0,
+                            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                        )
+                    """)
+
+                conn.commit()
+                conn.close()
+
+        # 创建所有表（SQLAlchemy ORM 管理的表）
         async with self._engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
 
@@ -190,8 +224,9 @@ class SQLiteBackend(StorageBackend):
         }
 
     async def delete_user(self, user_id: int) -> None:
-        """删除用户及所有关联的会话和消息（级联删除）"""
+        """删除用户及所有关联的会话、消息和预设（级联删除）"""
         async with self._session_factory() as db:
+            await db.execute(delete(PresetModel).where(PresetModel.user_id == user_id))
             await db.execute(delete(SessionModel).where(SessionModel.user_id == user_id))
             await db.execute(delete(UserModel).where(UserModel.id == user_id))
             await db.commit()
@@ -213,6 +248,7 @@ class SQLiteBackend(StorageBackend):
             "id": row.id,
             "title": row.title,
             "role": row.role,
+            "model_name": row.model_name,
             "user_id": row.user_id,
             "created_at": str(row.created_at),
             "updated_at": str(row.updated_at),
@@ -231,6 +267,7 @@ class SQLiteBackend(StorageBackend):
                 "id": r.id,
                 "title": r.title,
                 "role": r.role,
+                "model_name": r.model_name,
                 "created_at": str(r.created_at),
                 "updated_at": str(r.updated_at),
             }
@@ -238,10 +275,14 @@ class SQLiteBackend(StorageBackend):
         ]
 
     async def create_session(
-        self, session_id: str, user_id: int, title: str = "", role: str = "default"
+        self, session_id: str, user_id: int, title: str = "",
+        role: str = "default", model_name: str = "deepseek-chat",
     ) -> None:
         async with self._session_factory() as db:
-            db.add(SessionModel(id=session_id, title=title, user_id=user_id, role=role))
+            db.add(SessionModel(
+                id=session_id, title=title, user_id=user_id,
+                role=role, model_name=model_name,
+            ))
             await db.commit()
 
     async def delete_session(self, session_id: str) -> None:
@@ -264,6 +305,15 @@ class SQLiteBackend(StorageBackend):
                 update(SessionModel)
                 .where(SessionModel.id == session_id)
                 .values(role=role, updated_at=func.now())
+            )
+            await db.commit()
+
+    async def update_session_model(self, session_id: str, model_name: str) -> None:
+        async with self._session_factory() as db:
+            await db.execute(
+                update(SessionModel)
+                .where(SessionModel.id == session_id)
+                .values(model_name=model_name, updated_at=func.now())
             )
             await db.commit()
 
@@ -315,6 +365,129 @@ class SQLiteBackend(StorageBackend):
             if row and not row.title:
                 row.title = message[:20]
                 await db.commit()
+
+    # ------------------------------------------------------------------
+    # 预设操作
+    # ------------------------------------------------------------------
+
+    async def create_preset(
+        self, user_id: int, name: str, description: str, system_prompt: str
+    ) -> dict:
+        async with self._session_factory() as db:
+            preset = PresetModel(
+                user_id=user_id,
+                name=name,
+                description=description,
+                system_prompt=system_prompt,
+            )
+            db.add(preset)
+            await db.commit()
+            await db.refresh(preset)
+        return {
+            "id": preset.id,
+            "user_id": preset.user_id,
+            "name": preset.name,
+            "description": preset.description,
+            "system_prompt": preset.system_prompt,
+            "is_builtin": bool(preset.is_builtin),
+            "created_at": str(preset.created_at),
+            "updated_at": str(preset.updated_at),
+        }
+
+    async def get_presets_for_user(self, user_id: int) -> list[dict]:
+        async with self._session_factory() as db:
+            result = await db.execute(
+                select(PresetModel)
+                .where(PresetModel.user_id == user_id)
+                .order_by(PresetModel.created_at.desc())
+            )
+            rows = result.scalars().all()
+        return [
+            {
+                "id": p.id,
+                "user_id": p.user_id,
+                "name": p.name,
+                "description": p.description,
+                "system_prompt": p.system_prompt,
+                "is_builtin": bool(p.is_builtin),
+                "created_at": str(p.created_at),
+                "updated_at": str(p.updated_at),
+            }
+            for p in rows
+        ]
+
+    async def get_preset_by_name(self, name: str, user_id: int) -> dict | None:
+        async with self._session_factory() as db:
+            result = await db.execute(
+                select(PresetModel).where(
+                    PresetModel.name == name,
+                    PresetModel.user_id == user_id,
+                )
+            )
+            preset = result.scalar_one_or_none()
+        if not preset:
+            return None
+        return {
+            "id": preset.id,
+            "user_id": preset.user_id,
+            "name": preset.name,
+            "description": preset.description,
+            "system_prompt": preset.system_prompt,
+            "is_builtin": bool(preset.is_builtin),
+            "created_at": str(preset.created_at),
+            "updated_at": str(preset.updated_at),
+        }
+
+    async def update_preset(
+        self, preset_id: int, user_id: int,
+        name: str | None = None,
+        description: str | None = None,
+        system_prompt: str | None = None,
+    ) -> dict | None:
+        async with self._session_factory() as db:
+            result = await db.execute(
+                select(PresetModel).where(
+                    PresetModel.id == preset_id,
+                    PresetModel.user_id == user_id,
+                )
+            )
+            preset = result.scalar_one_or_none()
+            if not preset:
+                return None
+            if name is not None:
+                preset.name = name
+            if description is not None:
+                preset.description = description
+            if system_prompt is not None:
+                preset.system_prompt = system_prompt
+            preset.updated_at = func.now()
+            await db.commit()
+            await db.refresh(preset)
+        return {
+            "id": preset.id,
+            "user_id": preset.user_id,
+            "name": preset.name,
+            "description": preset.description,
+            "system_prompt": preset.system_prompt,
+            "is_builtin": bool(preset.is_builtin),
+            "created_at": str(preset.created_at),
+            "updated_at": str(preset.updated_at),
+        }
+
+    async def delete_preset(self, preset_id: int, user_id: int) -> bool:
+        async with self._session_factory() as db:
+            result = await db.execute(
+                select(PresetModel).where(
+                    PresetModel.id == preset_id,
+                    PresetModel.user_id == user_id,
+                )
+            )
+            preset = result.scalar_one_or_none()
+            if not preset:
+                return False
+            await db.delete(preset)
+            await db.commit()
+        return True
 
     # ------------------------------------------------------------------
     # 健康检查

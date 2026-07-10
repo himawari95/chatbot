@@ -22,6 +22,8 @@ from src.models.schemas import (
     ChatRequest,
     ChatResponse,
     LoginRequest,
+    PresetCreateRequest,
+    PresetUpdateRequest,
     RenameRequest,
     RoleUpdateRequest,
     SessionCreateRequest,
@@ -45,7 +47,7 @@ _storage = create_storage_backend(
 # 创建业务管理器
 _user_manager = UserManager(_storage)
 _session_manager = SessionManager(_storage)
-_chat_engine = ChatEngine(_session_manager, _presets, _config)
+_chat_engine = ChatEngine(_session_manager, _presets, _config, _storage)
 
 
 # =============================================================================
@@ -86,6 +88,29 @@ app.add_middleware(
 
 
 # =============================================================================
+# 辅助函数
+# =============================================================================
+
+
+async def _validate_role(role: str, user_id: int) -> bool:
+    """验证角色是否有效（内置预设 + 用户自定义预设）"""
+    if role in _presets.list_preset_names():
+        return True
+    preset = await _storage.get_preset_by_name(role, user_id)
+    return preset is not None
+
+
+async def _resolve_system_prompt(role: str, user_id: int) -> str:
+    """解析角色的系统提示词（内置优先，其次用户自定义）"""
+    if _presets.exists(role):
+        return _presets.get_system_prompt(role)
+    preset = await _storage.get_preset_by_name(role, user_id)
+    if preset:
+        return preset["system_prompt"]
+    return _presets.get_system_prompt("default")
+
+
+# =============================================================================
 # API 端点
 # =============================================================================
 
@@ -113,20 +138,88 @@ async def list_models():
 
 
 @app.get("/presets")
-async def list_presets():
-    """返回所有可用的角色预设"""
-    presets = _presets.list_presets()
-    return {
-        "presets": [
-            {
-                "name": p.name,
-                "label": p.label,
-                "emoji": p.emoji,
-                "system_prompt": p.system_prompt,
-            }
-            for p in presets
-        ]
-    }
+async def list_presets(user_id: int = Query(...)):
+    """返回所有可用的角色预设（内置 + 用户自定义）"""
+    builtin = [
+        {
+            "id": None,
+            "name": p.name,
+            "label": p.label,
+            "emoji": p.emoji,
+            "description": p.label,
+            "system_prompt": p.system_prompt,
+            "is_builtin": True,
+        }
+        for p in _presets.list_presets()
+    ]
+    user_presets = await _storage.get_presets_for_user(user_id)
+    custom = [
+        {
+            "id": p["id"],
+            "name": p["name"],
+            "label": p["name"],
+            "emoji": "👤",
+            "description": p.get("description", ""),
+            "system_prompt": p["system_prompt"],
+            "is_builtin": False,
+        }
+        for p in user_presets
+    ]
+    return {"presets": builtin + custom}
+
+
+@app.post("/presets")
+async def create_preset(req: PresetCreateRequest):
+    """创建用户自定义预设"""
+    try:
+        # 检查名称是否与内置预设冲突
+        if req.name in _presets.list_preset_names():
+            raise HTTPException(status_code=400, detail="预设名称与内置预设冲突")
+        # 检查用户是否已有同名预设
+        existing = await _storage.get_preset_by_name(req.name, req.user_id)
+        if existing:
+            raise HTTPException(status_code=400, detail="已存在同名预设")
+        preset = await _storage.create_preset(
+            req.user_id, req.name, req.description, req.system_prompt
+        )
+        return preset
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("创建预设失败")
+        raise HTTPException(status_code=500, detail="创建预设失败")
+
+
+@app.put("/presets/{preset_id}")
+async def update_preset(preset_id: int, req: PresetUpdateRequest):
+    """更新用户自定义预设"""
+    try:
+        preset = await _storage.update_preset(
+            preset_id, req.user_id, req.name, req.description, req.system_prompt
+        )
+        if not preset:
+            raise HTTPException(status_code=404, detail="预设不存在或无权修改")
+        return preset
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("更新预设失败")
+        raise HTTPException(status_code=500, detail="更新预设失败")
+
+
+@app.delete("/presets/{preset_id}")
+async def delete_preset(preset_id: int, user_id: int = Query(...)):
+    """删除用户自定义预设"""
+    try:
+        ok = await _storage.delete_preset(preset_id, user_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail="预设不存在或无权删除")
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("删除预设失败")
+        raise HTTPException(status_code=500, detail="删除预设失败")
 
 
 # --- 用户登录 ---
@@ -163,7 +256,7 @@ async def delete_user(user_id: int):
 async def chat(req: ChatRequest):
     """发送消息并获取完整 AI 回复（非流式）"""
     try:
-        if req.role not in _presets.list_preset_names():
+        if not await _validate_role(req.role, req.user_id):
             raise HTTPException(status_code=400, detail=f"未知角色: {req.role}")
         result = await _chat_engine.chat(
             message=req.message,
@@ -188,7 +281,7 @@ async def chat(req: ChatRequest):
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest):
     """发送消息并以 SSE 格式流式返回 AI 回复"""
-    if req.role not in _presets.list_preset_names():
+    if not await _validate_role(req.role, req.user_id):
         raise HTTPException(status_code=400, detail=f"未知角色: {req.role}")
 
     async def event_stream():
@@ -226,7 +319,7 @@ async def list_sessions(user_id: int = Query(...)):
 async def create_session(req: SessionCreateRequest):
     """创建新会话"""
     session = await _session_manager.create_session(
-        user_id=req.user_id, role=req.role
+        user_id=req.user_id, role=req.role, model_name=req.model_name,
     )
     return session
 
@@ -257,7 +350,7 @@ async def rename_session(session_id: str, req: RenameRequest):
 async def update_session_role(session_id: str, req: RoleUpdateRequest):
     """更新会话角色并返回该角色的消息历史"""
     try:
-        if req.role not in _presets.list_preset_names():
+        if not await _validate_role(req.role, req.user_id):
             raise HTTPException(status_code=400, detail=f"未知角色: {req.role}")
         await _session_manager.update_role(session_id, req.role, req.user_id)
         messages = await _session_manager.get_messages(session_id, req.role)

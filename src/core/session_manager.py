@@ -60,12 +60,13 @@ class SessionManager:
         return await self._storage.get_sessions_for_user(user_id)
 
     async def create_session(
-        self, user_id: int, role: str = "default", session_id: Optional[str] = None
+        self, user_id: int, role: str = "default",
+        model_name: str = "deepseek-chat", session_id: Optional[str] = None,
     ) -> dict:
         """创建新会话"""
         import uuid
         sid = session_id or uuid.uuid4().hex[:8]
-        await self._storage.create_session(sid, user_id, role=role)
+        await self._storage.create_session(sid, user_id, role=role, model_name=model_name)
         return await self._storage.get_session(sid)
 
     async def delete_session(self, session_id: str, user_id: int) -> None:
@@ -87,6 +88,10 @@ class SessionManager:
         """更新会话角色（需验证所有权）"""
         await self._verify_ownership(session_id, user_id)
         await self._storage.update_session_role(session_id, role)
+
+    async def update_model(self, session_id: str, model_name: str) -> None:
+        """更新会话使用的模型名称"""
+        await self._storage.update_session_model(session_id, model_name)
 
     async def verify_ownership(self, session_id: str, user_id: int) -> dict:
         """验证会话所有权（封装 _verify_ownership，供外部使用）"""

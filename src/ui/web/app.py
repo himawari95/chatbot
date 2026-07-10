@@ -84,13 +84,13 @@ async def _fetch_sessions(user_id: int) -> list[dict]:
     return []
 
 
-async def _create_session_api(user_id: int, role: str = "default") -> dict | None:
+async def _create_session_api(user_id: int, role: str = "default", model_name: str = "deepseek-chat") -> dict | None:
     """调用后端创建新会话"""
     try:
         async with httpx.AsyncClient() as c:
             r = await c.post(
                 f"{BACKEND_URL}/sessions",
-                json={"user_id": user_id, "role": role},
+                json={"user_id": user_id, "role": role, "model_name": model_name},
                 timeout=5.0,
             )
             if r.status_code == 200:
@@ -177,12 +177,99 @@ async def _delete_user_api(user_id: int) -> bool:
         return False
 
 
+async def _fetch_presets_api(user_id: int) -> list[dict]:
+    """获取所有可用预设（内置 + 用户自定义）"""
+    try:
+        async with httpx.AsyncClient() as c:
+            r = await c.get(
+                f"{BACKEND_URL}/presets",
+                params={"user_id": user_id},
+                timeout=5.0,
+            )
+            if r.status_code == 200:
+                return r.json().get("presets", [])
+    except Exception:
+        pass
+    return []
+
+
+async def _create_preset_api(user_id: int, name: str, description: str, system_prompt: str) -> dict | None:
+    """调用后端创建自定义预设"""
+    try:
+        async with httpx.AsyncClient() as c:
+            r = await c.post(
+                f"{BACKEND_URL}/presets",
+                json={"user_id": user_id, "name": name, "description": description, "system_prompt": system_prompt},
+                timeout=5.0,
+            )
+            if r.status_code == 200:
+                return r.json()
+    except Exception:
+        pass
+    return None
+
+
+async def _update_preset_api(preset_id: int, user_id: int, name: str | None = None, description: str | None = None, system_prompt: str | None = None) -> dict | None:
+    """调用后端更新自定义预设"""
+    try:
+        async with httpx.AsyncClient() as c:
+            body = {"user_id": user_id}
+            if name is not None:
+                body["name"] = name
+            if description is not None:
+                body["description"] = description
+            if system_prompt is not None:
+                body["system_prompt"] = system_prompt
+            r = await c.put(
+                f"{BACKEND_URL}/presets/{preset_id}",
+                json=body,
+                timeout=5.0,
+            )
+            if r.status_code == 200:
+                return r.json()
+    except Exception:
+        pass
+    return None
+
+
+async def _delete_preset_api(preset_id: int, user_id: int) -> bool:
+    """调用后端删除自定义预设"""
+    try:
+        async with httpx.AsyncClient() as c:
+            r = await c.delete(
+                f"{BACKEND_URL}/presets/{preset_id}",
+                params={"user_id": user_id},
+                timeout=5.0,
+            )
+            return r.status_code == 200
+    except Exception:
+        return False
+
+
+async def _refresh_role_choices(user_id: int) -> list[tuple[str, str]]:
+    """刷新角色下拉选项（内置 + 用户自定义）"""
+    if not user_id:
+        return ROLE_OPTIONS
+    presets = await _fetch_presets_api(user_id)
+    choices = []
+    for p in presets:
+        emoji = p.get("emoji", "🤖")
+        label = p.get("label", p["name"])
+        choices.append((f"{emoji} {label}", p["name"]))
+    return choices
+
+
 async def _build_dropdown(user_id: int) -> tuple[list, str | None]:
-    """构建会话下拉选项"""
+    """构建会话下拉选项（格式：标题 | 模型 | 预设 | 时间）"""
     sessions = await _fetch_sessions(user_id)
     choices = []
     for s in sessions:
-        label = s["title"] if s["title"] else s["id"]
+        title = s["title"] if s["title"] else s["id"]
+        model = s.get("model_name", "deepseek-chat")
+        role_key = s.get("role", "default")
+        role_label = _presets.get_preset(role_key).label
+        created = s.get("created_at", "")[:16].replace("T", " ")
+        label = f"{title} | {model} | {role_label} | {created}"
         choices.append((label, s["id"]))
     default_id = sessions[0]["id"] if sessions else None
     return choices, default_id
@@ -251,6 +338,10 @@ async def login(username: str) -> tuple:
             "default",     # role_state
             False,         # delete_pending_state
             gr.update(value="🗑 删除用户", variant="stop"),  # delete_user_btn
+            False,         # session_delete_pending_state
+            gr.update(value="🗑", variant="stop"),  # del_btn
+            gr.update(visible=False),  # cancel_del_btn
+            gr.update(),   # role_dd
         )
 
     user = await _login_user(username.strip())
@@ -264,11 +355,16 @@ async def login(username: str) -> tuple:
             "default",
             False,
             gr.update(value="🗑 删除用户", variant="stop"),
+            False,
+            gr.update(value="🗑", variant="stop"),
+            gr.update(visible=False),
+            gr.update(),
         )
 
     user_id = user["id"]
     username_val = user["username"]
     choices, default_id = await _build_dropdown(user_id)
+    role_choices = await _refresh_role_choices(user_id)
 
     if default_id:
         sessions = await _fetch_sessions(user_id)
@@ -295,6 +391,10 @@ async def login(username: str) -> tuple:
         session_role,
         False,
         gr.update(value="🗑 删除用户", variant="stop"),
+        False,
+        gr.update(value="🗑", variant="stop"),
+        gr.update(visible=False),
+        gr.update(choices=role_choices, value=session_role),
     )
 
 
@@ -308,6 +408,8 @@ async def delete_user(
             gr.update(), [], "", gr.update(),
             gr.update(value=""), "default", False,
             gr.update(value="🗑 删除用户", variant="stop"),
+            False, gr.update(value="🗑", variant="stop"), gr.update(visible=False),
+            gr.update(),
         )
 
     if not delete_pending:
@@ -318,6 +420,8 @@ async def delete_user(
             gr.update(), [], "", gr.update(),
             gr.update(value=""), "default", True,
             gr.update(value="⚠️ 确认删除", variant="stop"),
+            False, gr.update(value="🗑", variant="stop"), gr.update(visible=False),
+            gr.update(),
         )
 
     # 第二次点击：执行删除
@@ -328,6 +432,8 @@ async def delete_user(
             gr.update(choices=[], value=None), [], "", gr.update(),
             gr.update(value=""), "default", False,
             gr.update(value="🗑 删除用户", variant="stop"),
+            False, gr.update(value="🗑", variant="stop"), gr.update(visible=False),
+            gr.update(),
         )
     else:
         return (
@@ -336,6 +442,8 @@ async def delete_user(
             gr.update(), [], "", gr.update(),
             gr.update(value=""), "default", False,
             gr.update(value="🗑 删除用户", variant="stop"),
+            False, gr.update(value="🗑", variant="stop"), gr.update(visible=False),
+            gr.update(),
         )
 
 
@@ -358,7 +466,7 @@ async def respond(
         return
 
     if not session_id:
-        session = await _create_session_api(user_id, role)
+        session = await _create_session_api(user_id, role, model)
         if not session:
             history.append({"role": "assistant", "content": "⚠️ 无法创建会话"})
             yield history, gr.update(), ""
@@ -391,22 +499,22 @@ async def respond(
         yield history, gr.update(), session_id
 
 
-async def create_session(user_id: int, role: str) -> tuple[str, list, dict]:
+async def create_session(user_id: int, role: str, model_name: str) -> tuple:
     """创建新会话"""
     if not user_id:
-        return "", [], gr.update()
-    session = await _create_session_api(user_id, role)
+        return "", [], gr.update(), False, gr.update(value="🗑", variant="stop"), gr.update(visible=False)
+    session = await _create_session_api(user_id, role, model_name)
     if not session:
-        return "", [], gr.update()
+        return "", [], gr.update(), False, gr.update(value="🗑", variant="stop"), gr.update(visible=False)
     new_id = session["id"]
     choices, _ = await _build_dropdown(user_id)
-    return new_id, [], gr.update(choices=choices, value=new_id)
+    return new_id, [], gr.update(choices=choices, value=new_id), False, gr.update(value="🗑", variant="stop"), gr.update(visible=False)
 
 
-async def switch_session(session_id: str, user_id: int) -> tuple[list, str, dict, str]:
+async def switch_session(session_id: str, user_id: int) -> tuple:
     """切换到指定会话，加载对应角色的消息历史"""
     if not session_id or not user_id:
-        return [], "", gr.update(), "default"
+        return [], "", gr.update(), "default", False, gr.update(value="🗑", variant="stop"), gr.update(visible=False)
 
     sessions = await _fetch_sessions(user_id)
     session_role = "default"
@@ -419,13 +527,21 @@ async def switch_session(session_id: str, user_id: int) -> tuple[list, str, dict
     history = [{"role": m["role"], "content": m["content"]} for m in messages]
     choices, _ = await _build_dropdown(user_id)
 
-    return history, session_id, gr.update(choices=choices, value=session_id), session_role
+    return history, session_id, gr.update(choices=choices, value=session_id), session_role, False, gr.update(value="🗑", variant="stop"), gr.update(visible=False)
 
 
-async def delete_session(session_id: str, user_id: int) -> tuple[list, str, dict, str]:
-    """删除当前会话并自动切换到另一个"""
+async def delete_session(
+    session_id: str, user_id: int, delete_pending: bool
+) -> tuple[list, str, dict, str, bool, dict, dict]:
+    """删除当前会话 — 首次点击进入确认状态，显示取消按钮，再次点击确认执行删除"""
     if not session_id or not user_id:
-        return [], "", gr.update(), "default"
+        return gr.update(), "", gr.update(), "default", False, gr.update(value="🗑", variant="stop"), gr.update(visible=False)
+
+    if not delete_pending:
+        # 第一次点击：进入确认状态，显示取消按钮（不修改聊天窗口内容）
+        return gr.update(), session_id, gr.update(), "default", True, gr.update(value="⚠️ 确认删除", variant="stop"), gr.update(visible=True)
+
+    # 第二次点击：执行删除
     await _delete_session_api(session_id, user_id)
 
     choices, default_id = await _build_dropdown(user_id)
@@ -441,7 +557,12 @@ async def delete_session(session_id: str, user_id: int) -> tuple[list, str, dict
     else:
         history = []
         session_role = "default"
-    return history, default_id or "", gr.update(choices=choices, value=default_id), session_role
+    return history, default_id or "", gr.update(choices=choices, value=default_id), session_role, False, gr.update(value="🗑", variant="stop"), gr.update(visible=False)
+
+
+async def cancel_session_delete() -> tuple[bool, dict, dict]:
+    """取消会话删除确认"""
+    return False, gr.update(value="🗑", variant="stop"), gr.update(visible=False)
 
 
 async def rename_session(
@@ -473,6 +594,227 @@ async def change_role(
     return [], session_id, role, gr.update()
 
 
+# =============================================================================
+# 预设管理事件处理器
+# =============================================================================
+
+
+async def open_preset_manager(user_id: int):
+    """打开预设管理界面，加载预设列表"""
+    if not user_id:
+        return (
+            gr.update(choices=[], value=None),       # preset_list_dd
+            gr.update(visible=True),                   # preset_mgmt_group
+            gr.update(visible=False),                  # preset_form_group
+            gr.update(visible=False),                  # preset_del_confirm_btn
+            gr.update(value=""),                       # preset_name_box
+            gr.update(value=""),                       # preset_desc_box
+            gr.update(value=""),                       # preset_prompt_box
+            "none",                                    # preset_edit_mode
+            None,                                      # preset_edit_id
+            False,                                     # preset_delete_pending
+            gr.update(visible=True),                   # preset_add_btn
+            gr.update(visible=True),                   # preset_edit_btn
+            gr.update(visible=True),                   # preset_del_btn
+        )
+    presets = await _fetch_presets_api(user_id)
+    custom_presets = [p for p in presets if not p.get("is_builtin")]
+    choices = [(f"{p['name']} (自定义)", p["id"]) for p in custom_presets]
+    return (
+        gr.update(choices=choices, value=None),   # preset_list_dd
+        gr.update(visible=True),                   # preset_mgmt_group
+        gr.update(visible=False),                  # preset_form_group
+        gr.update(visible=False),                  # preset_del_confirm_btn
+        gr.update(value=""),                       # preset_name_box
+        gr.update(value=""),                       # preset_desc_box
+        gr.update(value=""),                       # preset_prompt_box
+        "none",                                    # preset_edit_mode
+        None,                                      # preset_edit_id
+        False,                                     # preset_delete_pending
+        gr.update(visible=True),                   # preset_add_btn
+        gr.update(visible=True),                   # preset_edit_btn
+        gr.update(visible=True),                   # preset_del_btn
+    )
+
+
+async def start_create_preset():
+    """显示创建预设表单"""
+    return (
+        gr.update(visible=True),
+        gr.update(visible=False),
+        gr.update(visible=False),
+        gr.update(value=""),
+        gr.update(value=""),
+        gr.update(value=""),
+        "create",
+        gr.update(visible=False),
+    )
+
+
+async def start_edit_preset(preset_id: int | None, user_id: int):
+    """加载预设数据到编辑表单"""
+    if not preset_id or not user_id:
+        return (
+            gr.update(visible=False),
+            gr.update(visible=True),
+            gr.update(value=""),
+            gr.update(value=""),
+            gr.update(value=""),
+            "none",
+            None,
+            gr.update(visible=False),
+        )
+    presets = await _fetch_presets_api(user_id)
+    target = None
+    for p in presets:
+        if p.get("id") == preset_id and not p.get("is_builtin"):
+            target = p
+            break
+    if not target:
+        return (
+            gr.update(visible=False),
+            gr.update(visible=True),
+            gr.update(value=""),
+            gr.update(value=""),
+            gr.update(value=""),
+            "none",
+            None,
+            gr.update(visible=False),
+        )
+    return (
+        gr.update(visible=False),
+        gr.update(visible=True),
+        gr.update(value=target["name"]),
+        gr.update(value=target.get("description", "")),
+        gr.update(value=target["system_prompt"]),
+        "edit",
+        preset_id,
+        gr.update(visible=False),
+    )
+
+
+async def save_preset(
+    mode: str, preset_id: int | None, user_id: int,
+    p_name: str, p_desc: str, p_prompt: str,
+):
+    """保存预设（创建或更新）
+    返回: preset_list_dd, role_dd, preset_form_group, preset_edit_btn,
+          preset_name_box, preset_desc_box, preset_prompt_box,
+          preset_edit_mode, preset_edit_id, preset_add_btn,
+          session_dd, preset_del_btn
+    """
+    if not user_id or not p_name.strip() or not p_prompt.strip():
+        return (
+            gr.update(), gr.update(),
+            gr.update(visible=False), gr.update(visible=False),
+            gr.update(value=""), gr.update(value=""), gr.update(value=""),
+            "none", None,
+            gr.update(visible=True), gr.update(),
+            gr.update(visible=False),
+        )
+
+    if mode == "create":
+        await _create_preset_api(user_id, p_name.strip(), p_desc.strip(), p_prompt.strip())
+    elif mode == "edit" and preset_id:
+        await _update_preset_api(preset_id, user_id, p_name.strip(), p_desc.strip(), p_prompt.strip())
+    else:
+        return (
+            gr.update(), gr.update(),
+            gr.update(visible=False), gr.update(visible=False),
+            gr.update(value=""), gr.update(value=""), gr.update(value=""),
+            "none", None,
+            gr.update(visible=True), gr.update(),
+            gr.update(visible=False),
+        )
+
+    # 刷新预设列表和角色下拉
+    presets = await _fetch_presets_api(user_id)
+    custom_presets = [p for p in presets if not p.get("is_builtin")]
+    p_choices = [(f"{p['name']} (自定义)", p["id"]) for p in custom_presets]
+    role_choices = await _refresh_role_choices(user_id)
+
+    return (
+        gr.update(choices=p_choices, value=None),  # preset_list_dd
+        gr.update(choices=role_choices),            # role_dd
+        gr.update(visible=False),                   # preset_form_group
+        gr.update(visible=False),                   # preset_edit_btn
+        gr.update(value=""),                        # preset_name_box
+        gr.update(value=""),                        # preset_desc_box
+        gr.update(value=""),                        # preset_prompt_box
+        "none",                                     # preset_edit_mode
+        None,                                       # preset_edit_id
+        gr.update(visible=True),                    # preset_add_btn
+        gr.update(),                                # session_dd
+        gr.update(visible=False),                   # preset_del_btn
+    )
+
+
+async def delete_preset_confirm(preset_id: int | None):
+    """进入删除确认状态"""
+    if not preset_id:
+        return False, gr.update(visible=False)
+    return True, gr.update(visible=True)
+
+
+async def delete_preset_execute(preset_id: int | None, user_id: int):
+    """执行删除预设
+    返回: preset_list_dd, role_dd, session_dd,
+          preset_delete_pending, preset_del_confirm_btn,
+          preset_form_group, preset_edit_btn,
+          preset_name_box, preset_desc_box, preset_prompt_box,
+          preset_edit_mode, preset_edit_id, preset_add_btn
+    """
+    if not preset_id or not user_id:
+        return (
+            gr.update(), gr.update(), gr.update(),
+            False, gr.update(visible=False),
+            gr.update(visible=False), gr.update(visible=False),
+            gr.update(value=""), gr.update(value=""), gr.update(value=""),
+            "none", None,
+            gr.update(visible=True),
+        )
+
+    await _delete_preset_api(preset_id, user_id)
+
+    # 刷新
+    presets = await _fetch_presets_api(user_id)
+    custom_presets = [p for p in presets if not p.get("is_builtin")]
+    p_choices = [(f"{p['name']} (自定义)", p["id"]) for p in custom_presets]
+    role_choices = await _refresh_role_choices(user_id)
+
+    return (
+        gr.update(choices=p_choices, value=None),  # preset_list_dd
+        gr.update(choices=role_choices),            # role_dd
+        gr.update(),                                # session_dd
+        False,                                      # preset_delete_pending
+        gr.update(visible=False),                   # preset_del_confirm_btn
+        gr.update(visible=False),                   # preset_form_group
+        gr.update(visible=False),                   # preset_edit_btn
+        gr.update(value=""),                        # preset_name_box
+        gr.update(value=""),                        # preset_desc_box
+        gr.update(value=""),                        # preset_prompt_box
+        "none",                                     # preset_edit_mode
+        None,                                       # preset_edit_id
+        gr.update(visible=True),                    # preset_add_btn
+    )
+
+
+async def cancel_preset_form():
+    """取消预设编辑/创建"""
+    return (
+        gr.update(visible=False),
+        gr.update(visible=False),
+        gr.update(value=""),
+        gr.update(value=""),
+        gr.update(value=""),
+        "none",
+        None,
+        gr.update(visible=True),
+        False,
+        gr.update(visible=False),
+    )
+
+
 def on_startup():
     """页面加载时的初始化回调"""
 
@@ -501,6 +843,10 @@ def build_ui() -> gr.Blocks:
         username_state = gr.State("")
         role_state = gr.State("default")
         delete_pending_state = gr.State(False)
+        session_delete_pending_state = gr.State(False)
+        preset_edit_mode = gr.State("none")      # "none" | "create" | "edit"
+        preset_edit_id = gr.State(None)
+        preset_delete_pending = gr.State(False)
 
         # --- 页头 ---
         gr.Markdown("# 🤖 Chatbot")
@@ -543,6 +889,7 @@ def build_ui() -> gr.Blocks:
             )
             new_btn = gr.Button("＋ 新会话", scale=1, variant="secondary", size="sm")
             del_btn = gr.Button("🗑", scale=0, variant="stop", size="sm", min_width=40)
+            cancel_del_btn = gr.Button("取消", scale=0, variant="secondary", size="sm", visible=False)
 
         # --- 重命名行 ---
         with gr.Row(equal_height=True):
@@ -553,6 +900,41 @@ def build_ui() -> gr.Blocks:
                 container=False,
             )
             rename_btn = gr.Button("✏️ 重命名", scale=1, variant="secondary", size="sm")
+
+        # --- 预设管理按钮 ---
+        with gr.Row(equal_height=True):
+            preset_mgmt_btn = gr.Button("⚙️ 预设管理", scale=1, variant="secondary", size="sm")
+
+        # --- 预设管理区域（默认隐藏）---
+        with gr.Group(visible=False) as preset_mgmt_group:
+            gr.Markdown("### 🎭 预设管理")
+            with gr.Row(equal_height=True):
+                preset_list_dd = gr.Dropdown(
+                    label="我的预设",
+                    choices=[],
+                    value=None,
+                    scale=4,
+                    interactive=True,
+                )
+                preset_add_btn = gr.Button("➕ 新增", scale=1, variant="primary", size="sm")
+                preset_edit_btn = gr.Button("✏️ 编辑", scale=1, variant="secondary", size="sm")
+                preset_del_btn = gr.Button("🗑 删除", scale=1, variant="stop", size="sm")
+
+            # 删除确认按钮
+            preset_del_confirm_btn = gr.Button("⚠️ 确认删除", variant="stop", size="sm", visible=False)
+
+            # 新增/编辑表单
+            with gr.Group(visible=False) as preset_form_group:
+                preset_name_box = gr.Textbox(label="预设名称", placeholder="输入预设名称...")
+                preset_desc_box = gr.Textbox(label="描述", placeholder="简短描述...")
+                preset_prompt_box = gr.Textbox(
+                    label="System Prompt",
+                    placeholder="输入系统提示词...",
+                    lines=4,
+                )
+                with gr.Row(equal_height=True):
+                    preset_save_btn = gr.Button("💾 保存", variant="primary", scale=1)
+                    preset_cancel_btn = gr.Button("❌ 取消", variant="secondary", scale=1)
 
         # --- 聊天显示区 ---
         chatbot = gr.Chatbot(
@@ -589,6 +971,8 @@ def build_ui() -> gr.Blocks:
                 user_state, username_state, user_md, session_dd, chatbot,
                 session_state, msg_box, rename_box, role_state,
                 delete_pending_state, delete_user_btn,
+                session_delete_pending_state, del_btn, cancel_del_btn,
+                role_dd,
             ],
         )
 
@@ -599,6 +983,8 @@ def build_ui() -> gr.Blocks:
                 user_state, username_state, user_md, session_dd, chatbot,
                 session_state, msg_box, rename_box, role_state,
                 delete_pending_state, delete_user_btn,
+                session_delete_pending_state, del_btn, cancel_del_btn,
+                role_dd,
             ],
         )
 
@@ -616,20 +1002,29 @@ def build_ui() -> gr.Blocks:
 
         new_btn.click(
             create_session,
-            inputs=[user_state, role_state],
-            outputs=[session_state, chatbot, session_dd],
+            inputs=[user_state, role_state, model_dd],
+            outputs=[session_state, chatbot, session_dd,
+                     session_delete_pending_state, del_btn, cancel_del_btn],
         )
 
         session_dd.change(
             switch_session,
             inputs=[session_dd, user_state],
-            outputs=[chatbot, session_state, session_dd, role_state],
+            outputs=[chatbot, session_state, session_dd, role_state,
+                     session_delete_pending_state, del_btn, cancel_del_btn],
         )
 
         del_btn.click(
             delete_session,
-            inputs=[session_state, user_state],
-            outputs=[chatbot, session_state, session_dd, role_state],
+            inputs=[session_state, user_state, session_delete_pending_state],
+            outputs=[chatbot, session_state, session_dd, role_state,
+                     session_delete_pending_state, del_btn, cancel_del_btn],
+        )
+
+        cancel_del_btn.click(
+            cancel_session_delete,
+            inputs=[],
+            outputs=[session_delete_pending_state, del_btn, cancel_del_btn],
         )
 
         rename_btn.click(
@@ -642,6 +1037,83 @@ def build_ui() -> gr.Blocks:
             change_role,
             inputs=[session_state, role_dd, user_state],
             outputs=[chatbot, session_state, role_state, session_dd],
+        )
+
+        # --- 预设管理事件 ---
+
+        preset_mgmt_btn.click(
+            open_preset_manager,
+            inputs=[user_state],
+            outputs=[
+                preset_list_dd, preset_mgmt_group, preset_form_group,
+                preset_del_confirm_btn, preset_name_box, preset_desc_box,
+                preset_prompt_box, preset_edit_mode, preset_edit_id,
+                preset_delete_pending, preset_add_btn, preset_edit_btn,
+                preset_del_btn,
+            ],
+        )
+
+        preset_add_btn.click(
+            start_create_preset,
+            inputs=[],
+            outputs=[
+                preset_form_group, preset_edit_btn, preset_del_btn,
+                preset_name_box, preset_desc_box, preset_prompt_box,
+                preset_edit_mode, preset_add_btn,
+            ],
+        )
+
+        preset_edit_btn.click(
+            start_edit_preset,
+            inputs=[preset_list_dd, user_state],
+            outputs=[
+                preset_form_group, preset_edit_btn, preset_name_box,
+                preset_desc_box, preset_prompt_box, preset_edit_mode,
+                preset_edit_id, preset_add_btn,
+            ],
+        )
+
+        preset_save_btn.click(
+            save_preset,
+            inputs=[
+                preset_edit_mode, preset_edit_id, user_state,
+                preset_name_box, preset_desc_box, preset_prompt_box,
+            ],
+            outputs=[
+                preset_list_dd, role_dd, preset_form_group,
+                preset_edit_btn, preset_name_box, preset_desc_box,
+                preset_prompt_box, preset_edit_mode, preset_edit_id,
+                preset_add_btn, session_dd, preset_del_btn,
+            ],
+        )
+
+        preset_del_btn.click(
+            delete_preset_confirm,
+            inputs=[preset_list_dd],
+            outputs=[preset_delete_pending, preset_del_confirm_btn],
+        )
+
+        preset_del_confirm_btn.click(
+            delete_preset_execute,
+            inputs=[preset_list_dd, user_state],
+            outputs=[
+                preset_list_dd, role_dd, session_dd,
+                preset_delete_pending, preset_del_confirm_btn,
+                preset_form_group, preset_edit_btn,
+                preset_name_box, preset_desc_box, preset_prompt_box,
+                preset_edit_mode, preset_edit_id, preset_add_btn,
+            ],
+        )
+
+        preset_cancel_btn.click(
+            cancel_preset_form,
+            inputs=[],
+            outputs=[
+                preset_form_group, preset_edit_btn,
+                preset_name_box, preset_desc_box, preset_prompt_box,
+                preset_edit_mode, preset_edit_id, preset_add_btn,
+                preset_delete_pending, preset_del_confirm_btn,
+            ],
         )
 
         demo.load(

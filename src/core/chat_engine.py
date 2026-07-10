@@ -16,6 +16,7 @@ from langchain_openai import ChatOpenAI
 from src.core.config_manager import ConfigManager, get_config
 from src.core.preset_manager import PresetManager, get_preset_manager
 from src.core.session_manager import SessionManager
+from src.storage.base import StorageBackend
 
 logger = logging.getLogger("chatbot")
 
@@ -28,10 +29,12 @@ class ChatEngine:
         session_manager: SessionManager,
         preset_manager: PresetManager | None = None,
         config: ConfigManager | None = None,
+        storage: StorageBackend | None = None,
     ):
         self._sessions = session_manager
         self._presets = preset_manager or get_preset_manager()
         self._config = config or get_config()
+        self._storage = storage
 
     # ------------------------------------------------------------------
     # LLM 构建
@@ -87,6 +90,9 @@ class ChatEngine:
         await self._sessions.verify_ownership(session_id, user_id)
         await self._sessions.load_memory(session_id, role)
 
+        model_name = model or self._config.default_model
+        await self._sessions.update_model(session_id, model_name)
+
         llm = self.build_llm(model)
         memory = self._sessions.get_memory(session_id, role)
 
@@ -119,10 +125,19 @@ class ChatEngine:
         try:
             await self._sessions.verify_ownership(session_id, user_id)
 
-            # 获取角色的系统提示词
-            system_prompt = self._presets.get_system_prompt(role)
+            # 获取角色的系统提示词（内置优先，其次用户自定义）
+            if self._presets.exists(role):
+                system_prompt = self._presets.get_system_prompt(role)
+            elif self._storage:
+                preset = await self._storage.get_preset_by_name(role, user_id)
+                system_prompt = preset["system_prompt"] if preset else self._presets.get_system_prompt("default")
+            else:
+                system_prompt = self._presets.get_system_prompt("default")
 
-            # 更新会话角色
+            # 更新会话角色和模型
+            model_name = model or self._config.default_model
+            await self._sessions.update_model(session_id, model_name)
+
             session = await self._sessions.get_session(session_id)
             if session and session.get("role") != role:
                 await self._sessions.update_role(session_id, role, user_id)

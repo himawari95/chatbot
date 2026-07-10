@@ -32,6 +32,7 @@ class SessionCreateRequest(BaseModel):
     """创建会话请求"""
     user_id: int
     role: str = "default"
+    model_name: str = "deepseek-chat"
 
 
 class RenameRequest(BaseModel):
@@ -44,6 +45,22 @@ class RoleUpdateRequest(BaseModel):
     """更新会话角色请求"""
     role: str
     user_id: int
+
+
+class PresetCreateRequest(BaseModel):
+    """创建预设请求"""
+    user_id: int
+    name: str
+    description: str = ""
+    system_prompt: str
+
+
+class PresetUpdateRequest(BaseModel):
+    """更新预设请求"""
+    user_id: int
+    name: str | None = None
+    description: str | None = None
+    system_prompt: str | None = None
 
 
 # =============================================================================
