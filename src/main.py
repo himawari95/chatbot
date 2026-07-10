@@ -9,7 +9,8 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
@@ -17,6 +18,7 @@ from src.core.chat_engine import ChatEngine
 from src.core.config_manager import get_config
 from src.core.preset_manager import get_preset_manager
 from src.core.session_manager import SessionManager
+from src.core.tts_service import get_tts_service
 from src.core.user_manager import UserManager
 from src.models.schemas import (
     ChatRequest,
@@ -49,6 +51,7 @@ _storage = create_storage_backend(
 _user_manager = UserManager(_storage)
 _session_manager = SessionManager(_storage)
 _chat_engine = ChatEngine(_session_manager, _presets, _config, _storage)
+_tts_service = get_tts_service()
 
 
 # =============================================================================
@@ -338,6 +341,65 @@ async def chat_parallel(req: ParallelChatRequest):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# --- 文件上传与多模态对话 ---
+
+
+@app.post("/chat/upload")
+async def chat_upload(
+    user_id: int = Query(...),
+    session_id: str = Query(...),
+    role: str = Query("default"),
+    model: str = Query(""),
+    message: str = Query(""),
+    file: UploadFile = File(...),
+):
+    """上传文件并进行多模态对话（图片识别 / 文档分析）"""
+    try:
+        if not await _validate_role(role, user_id):
+            raise HTTPException(status_code=400, detail=f"未知角色: {role}")
+
+        file_data = await file.read()
+        model_name = model or None
+
+        result = await _chat_engine.chat_with_file(
+            message=message,
+            file_data=file_data,
+            filename=file.filename or "unknown",
+            session_id=session_id,
+            user_id=user_id,
+            role=role,
+            model=model_name,
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("文件上传处理失败")
+        raise HTTPException(status_code=500, detail="文件处理失败")
+
+
+# --- 语音合成（TTS）---
+
+
+@app.post("/tts")
+async def text_to_speech(text: str = Query(..., description="要朗读的文本")):
+    """将文本转为语音（Edge TTS），返回 MP3 音频"""
+    try:
+        audio_data = await _tts_service.text_to_speech(text)
+        return Response(
+            content=audio_data,
+            media_type="audio/mpeg",
+            headers={"Content-Disposition": "inline"},
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        logger.exception("TTS 请求失败")
+        raise HTTPException(status_code=500, detail="语音合成失败")
 
 
 # --- 会话 CRUD ---

@@ -6,6 +6,7 @@ Chatbot 前端 — Gradio Web UI
 import asyncio
 import json
 import logging
+from pathlib import Path
 from typing import AsyncGenerator
 
 import gradio as gr
@@ -22,6 +23,12 @@ _backend = BackendConfig()
 BACKEND_URL = _backend.base_url
 
 logger = logging.getLogger("chatbot")
+
+# 加载前端语音模块 JavaScript
+_VOICE_JS_PATH = Path(__file__).parent / "static" / "voice.js"
+_VOICE_JS_CONTENT = ""
+if _VOICE_JS_PATH.exists():
+    _VOICE_JS_CONTENT = _VOICE_JS_PATH.read_text(encoding="utf-8")
 
 # 从预设管理器加载角色选项
 _presets = get_preset_manager()
@@ -297,6 +304,30 @@ async def _parallel_stream_tokens(
                 yield payload
 
 
+async def _upload_file_api(
+    file_data: bytes, filename: str, user_id: int, session_id: str,
+    message: str = "", role: str = "default",
+) -> dict | None:
+    """调用后端文件上传与多模态对话接口"""
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0)) as c:
+            r = await c.post(
+                f"{BACKEND_URL}/chat/upload",
+                params={
+                    "user_id": user_id,
+                    "session_id": session_id,
+                    "role": role,
+                    "message": message,
+                },
+                files={"file": (filename, file_data)},
+            )
+            if r.status_code == 200:
+                return r.json()
+    except Exception:
+        pass
+    return None
+
+
 async def _export_session_api(session_id: str, user_id: int) -> dict | None:
     """调用后端导出会话"""
     try:
@@ -560,27 +591,54 @@ async def respond(
     model: str,
     user_id: int,
     role: str,
+    file_path: str | None = None,
 ):
-    """主聊天处理器 — 逐 token 流式输出 AI 回复，完成后显示 token 用量"""
-    if not message.strip():
-        yield history, gr.update(), session_id, gr.update()
+    """聊天处理器 — 支持纯文本和文件上传"""
+    if not message.strip() and not file_path:
+        yield history, gr.update(), session_id, gr.update(), gr.update()
         return
 
     if not user_id:
         history.append({"role": "assistant", "content": "⚠️ 请先登录后再发送消息"})
-        yield history, gr.update(), session_id, gr.update()
+        yield history, gr.update(), session_id, gr.update(), gr.update()
         return
 
     if not session_id:
         session = await _create_session_api(user_id, role, model)
         if not session:
             history.append({"role": "assistant", "content": "⚠️ 无法创建会话"})
-            yield history, gr.update(), "", gr.update()
+            yield history, gr.update(), "", gr.update(), gr.update()
             return
         session_id = session["id"]
 
+    # 文件上传分支
+    if file_path:
+        try:
+            with open(file_path, "rb") as f:
+                file_data = f.read()
+        except Exception as e:
+            history.append({"role": "assistant", "content": f"⚠️ 读取文件失败：{e}"})
+            yield history, gr.update(), session_id, gr.update(), gr.update(value=None)
+            return
+
+        filename = file_path.replace("\\", "/").split("/")[-1]
+        display = f"[文件：{filename}] {message}" if message.strip() else f"[文件：{filename}]"
+        history.append({"role": "user", "content": display})
+        history.append({"role": "assistant", "content": "⏳ 正在处理文件..."})
+        yield history, gr.update(value=""), session_id, gr.update(), gr.update(value=None)
+
+        result = await _upload_file_api(file_data, filename, user_id, session_id, message, role)
+        if not result:
+            history[-1]["content"] = "⚠️ 文件处理失败"
+            yield history, gr.update(), session_id, gr.update(), gr.update(value=None)
+            return
+        history[-1]["content"] = result["response"]
+        yield history, gr.update(), session_id, gr.update(), gr.update(value=None)
+        return
+
+    # 纯文本分支（原有逻辑）
     history.append({"role": "user", "content": message})
-    yield history, gr.update(value=""), session_id, gr.update()
+    yield history, gr.update(value=""), session_id, gr.update(), gr.update()
 
     history.append({"role": "assistant", "content": ""})
 
@@ -588,30 +646,28 @@ async def respond(
         usage_out: dict = {}
         async for token in _stream_tokens(message, session_id, model, user_id, role, usage_out):
             history[-1]["content"] += token
-            yield history, gr.update(), session_id, gr.update()
+            yield history, gr.update(), session_id, gr.update(), gr.update()
 
         # 流结束，获取累计 token 统计
         if usage_out:
             cumulative = await _fetch_session_tokens(session_id, user_id)
             token_md = _format_tokens(usage_out, cumulative)
-            yield history, gr.update(), session_id, token_md
+            yield history, gr.update(), session_id, token_md, gr.update()
         else:
-            yield history, gr.update(), session_id, gr.update()
+            yield history, gr.update(), session_id, gr.update(), gr.update()
 
     except httpx.ConnectError:
-        history[-1]["content"] = (
-            "⚠️ 无法连接到后端服务，请确认服务已启动。"
-        )
-        yield history, gr.update(), session_id, gr.update()
+        history[-1]["content"] = "⚠️ 无法连接到后端服务，请确认服务已启动。"
+        yield history, gr.update(), session_id, gr.update(), gr.update()
     except httpx.ReadTimeout:
         history[-1]["content"] += "\n\n⚠️ 请求超时，请重试。"
-        yield history, gr.update(), session_id, gr.update()
+        yield history, gr.update(), session_id, gr.update(), gr.update()
     except RuntimeError as e:
         history[-1]["content"] = f"⚠️ {e}"
-        yield history, gr.update(), session_id, gr.update()
+        yield history, gr.update(), session_id, gr.update(), gr.update()
     except Exception as e:
         history[-1]["content"] = f"⚠️ 发生未知错误：{e}"
-        yield history, gr.update(), session_id, gr.update()
+        yield history, gr.update(), session_id, gr.update(), gr.update()
 
 
 async def create_session(user_id: int, role: str, model_name: str) -> tuple:
@@ -952,6 +1008,52 @@ async def search_messages(user_id: int, keyword: str) -> str:
     return "\n".join(lines)
 
 
+async def upload_and_chat(
+    file_path: str | None, message: str, history: list[dict],
+    session_id: str, user_id: int, role: str,
+):
+    """文件上传处理器 — 读取文件并发送到后端进行多模态对话"""
+    if not user_id:
+        history.append({"role": "assistant", "content": "⚠️ 请先登录"})
+        yield history, file_path, gr.update()
+        return
+
+    if not file_path:
+        yield history, file_path, gr.update()
+        return
+
+    if not session_id:
+        session = await _create_session_api(user_id, role, "deepseek-chat")
+        if not session:
+            history.append({"role": "assistant", "content": "⚠️ 无法创建会话"})
+            yield history, file_path, gr.update()
+            return
+        session_id = session["id"]
+
+    # 读取文件
+    try:
+        with open(file_path, "rb") as f:
+            file_data = f.read()
+    except Exception as e:
+        history.append({"role": "assistant", "content": f"⚠️ 读取文件失败：{e}"})
+        yield history, file_path, gr.update()
+        return
+
+    filename = file_path.replace("\\", "/").split("/")[-1]
+    history.append({"role": "user", "content": f"[文件：{filename}] {message}" if message else f"[文件：{filename}]"})
+    history.append({"role": "assistant", "content": "⏳ 正在处理文件..."})
+    yield history, file_path, gr.update()
+
+    result = await _upload_file_api(file_data, filename, user_id, session_id, message, role)
+    if not result:
+        history[-1]["content"] = "⚠️ 文件处理失败 — 请检查后端是否正常"
+        yield history, file_path, gr.update()
+        return
+
+    history[-1]["content"] = result["response"]
+    yield history, file_path, gr.update()
+
+
 async def export_current_session(session_id: str, user_id: int) -> str:
     """导出当前会话到桌面"""
     if not user_id:
@@ -1091,6 +1193,57 @@ def build_ui() -> gr.Blocks:
         status_md = gr.Markdown("⏳ 正在检查后端...")
         user_md = gr.Markdown("### ⚠️ 请先登录")
 
+        # --- 语音输入按钮（HTML）---
+        voice_mic_html = gr.HTML(
+            value="""
+            <button id="voice-mic-btn" style="
+                width:100%; padding:8px 16px; font-size:14px; cursor:pointer;
+                border:1px solid #d1d5db; border-radius:6px; background:#f9fafb;
+                color:#374151; transition:all 0.2s;
+            " onmouseover="this.style.background='#f3f4f6'" onmouseout="this.style.background='#f9fafb'">
+                🎤 语音输入
+            </button>
+            """,
+            visible=True,
+            head=f"""<script>
+{_VOICE_JS_CONTENT}
+
+// ---- 麦克风按钮事件绑定 ----
+(function() {{
+    function bindMic() {{
+        var btn = document.getElementById('voice-mic-btn');
+        if (!btn) {{ setTimeout(bindMic, 200); return; }}
+        btn.addEventListener('click', function() {{
+            window.toggleVoiceInput();
+        }});
+    }}
+    bindMic();
+}})();
+
+// ---- 助手消息播放按钮观察器 ----
+(function() {{
+    var apiBase = '{BACKEND_URL}';
+    var observer = new MutationObserver(function() {{
+        var bots = document.querySelectorAll('.bot');
+        if (!bots.length) return;
+        bots.forEach(function(bot) {{
+            if (bot.querySelector('.voice-play-btn')) return;
+            var btn = document.createElement('button');
+            btn.className = 'voice-play-btn';
+            btn.textContent = '🔊';
+            btn.title = '播放语音';
+            btn.style.cssText = 'margin:2px 0;padding:1px 6px;font-size:11px;cursor:pointer;border:1px solid #ccc;border-radius:3px;background:#f5f5f5;float:right;';
+            btn.onclick = function() {{
+                var text = bot.textContent.replace('🔊', '').trim();
+                if (text) window.playTTS(text, apiBase);
+            }};
+            bot.appendChild(btn);
+        }});
+    }});
+    observer.observe(document.body, {{ childList: true, subtree: true }});
+}})();
+</script>""")
+
         # --- 登录行 ---
         with gr.Row(equal_height=True):
             login_box = gr.Textbox(
@@ -1219,6 +1372,12 @@ def build_ui() -> gr.Blocks:
                 scale=10,
                 container=False,
             )
+            file_upload = gr.File(
+                label="",
+                scale=2,
+                file_count="single",
+                file_types=[".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".pdf", ".docx", ".txt"],
+            )
             send_btn = gr.Button("发送", scale=1, variant="primary")
 
         # --- 快捷提问 ---
@@ -1270,14 +1429,14 @@ def build_ui() -> gr.Blocks:
 
         send_btn.click(
             respond,
-            inputs=[msg_box, chatbot, session_state, model_dd, user_state, role_state],
-            outputs=[chatbot, msg_box, session_state, token_md],
+            inputs=[msg_box, chatbot, session_state, model_dd, user_state, role_state, file_upload],
+            outputs=[chatbot, msg_box, session_state, token_md, file_upload],
         )
 
         msg_box.submit(
             respond,
-            inputs=[msg_box, chatbot, session_state, model_dd, user_state, role_state],
-            outputs=[chatbot, msg_box, session_state, token_md],
+            inputs=[msg_box, chatbot, session_state, model_dd, user_state, role_state, file_upload],
+            outputs=[chatbot, msg_box, session_state, token_md, file_upload],
         )
 
         new_btn.click(

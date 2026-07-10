@@ -5,8 +5,11 @@
 """
 
 import asyncio
+import base64
+import io
 import json
 import logging
+import os
 import time
 from typing import AsyncGenerator, Optional
 
@@ -358,6 +361,166 @@ class ChatEngine:
         except Exception:
             logger.exception("并行聊天出错")
             yield f"data: {json.dumps({'error': '服务器内部错误'})}\n\n"
+
+    # ------------------------------------------------------------------
+    # 文件处理与多模态对话
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _detect_file_type(filename: str) -> str:
+        """根据扩展名判断文件类型"""
+        ext = os.path.splitext(filename)[1].lower()
+        if ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"):
+            return "image"
+        if ext == ".pdf":
+            return "pdf"
+        if ext == ".docx":
+            return "docx"
+        if ext == ".txt":
+            return "txt"
+        return "unknown"
+
+    async def _extract_text_from_file(
+        self, file_data: bytes, file_type: str, filename: str,
+    ) -> str:
+        """从文件中提取文字内容（在线程池中运行以避免阻塞）"""
+        if file_type == "txt":
+            return file_data.decode("utf-8", errors="replace")
+
+        if file_type == "pdf":
+            import PyPDF2
+            def _extract():
+                reader = PyPDF2.PdfReader(io.BytesIO(file_data))
+                parts = []
+                for page in reader.pages:
+                    text = page.extract_text()
+                    if text:
+                        parts.append(text)
+                return "\n".join(parts)
+            return await asyncio.to_thread(_extract)
+
+        if file_type == "docx":
+            import docx
+            def _extract():
+                doc = docx.Document(io.BytesIO(file_data))
+                return "\n".join(p.text for p in doc.paragraphs if p.text)
+            return await asyncio.to_thread(_extract)
+
+        return ""
+
+    async def _call_vision_model(
+        self, image_data: bytes, prompt: str, filename: str,
+    ) -> str:
+        """调用视觉模型识别图片内容"""
+        vcfg = self._config.get_vision_model_config()
+        if not vcfg or not vcfg["api_key"]:
+            return "视觉模型未配置 API Key，请检查 .env"
+
+        # 将图片编码为 base64
+        ext = os.path.splitext(filename)[1].lower().lstrip(".")
+        mime_map = {"jpg": "jpeg", "jpeg": "jpeg", "png": "png", "gif": "gif",
+                     "webp": "webp", "bmp": "bmp"}
+        mime = mime_map.get(ext, "jpeg")
+        b64 = base64.b64encode(image_data).decode("utf-8")
+        image_url = f"data:image/{mime};base64,{b64}"
+
+        # 构建 VL 模型消息（OpenAI 兼容格式）
+        from langchain_core.messages import HumanMessage as _HM
+        msg = _HM(content=[
+            {"type": "image_url", "image_url": {"url": image_url}},
+            {"type": "text", "text": prompt or "请描述这张图片"},
+        ])
+
+        vl_llm = ChatOpenAI(
+            model=vcfg["model"],
+            openai_api_key=vcfg["api_key"],
+            openai_api_base=vcfg["base_url"],
+            temperature=0.7,
+        )
+
+        result = await vl_llm.ainvoke([msg])
+        return result.content if hasattr(result, "content") else str(result)
+
+    async def chat_with_file(
+        self,
+        message: str,
+        file_data: bytes,
+        filename: str,
+        session_id: str,
+        user_id: int,
+        role: str = "default",
+        model: Optional[str] = None,
+    ) -> dict:
+        """处理文件上传并进行对话。
+
+        图片：调用视觉模型识别
+        PDF/DOCX/TXT：提取文字后发送给文本模型
+        """
+        await self._sessions.verify_ownership(session_id, user_id)
+
+        # 文件大小限制
+        max_size = self._config.vision_max_file_size_mb * 1024 * 1024
+        if len(file_data) > max_size:
+            raise ValueError(f"文件大小超过限制（{self._config.vision_max_file_size_mb}MB）")
+
+        file_type = self._detect_file_type(filename)
+        if file_type == "unknown":
+            raise ValueError(f"不支持的文件格式：{filename}")
+
+        # 保存用户消息（含文件名）
+        user_content = f"[文件：{filename}]\n{message}" if message else f"[文件：{filename}]"
+        await self._sessions.save_message(session_id, "user", user_content, role)
+
+        # 加载对话上下文
+        model_name = model or self._config.default_model
+        await self._sessions.update_model(session_id, model_name)
+
+        if self._presets.exists(role):
+            system_prompt = self._presets.get_system_prompt(role)
+        elif self._storage:
+            preset = await self._storage.get_preset_by_name(role, user_id)
+            system_prompt = preset["system_prompt"] if preset else self._presets.get_system_prompt("default")
+        else:
+            system_prompt = self._presets.get_system_prompt("default")
+
+        memory = await self._sessions.load_memory(session_id, role)
+
+        # 处理文件内容
+        if file_type == "image" and self._config.vision_enabled:
+            # 图片：先调用视觉模型识别，再将结果发给文本模型
+            prompt = message or "请描述这张图片"
+            vision_result = await self._call_vision_model(file_data, prompt, filename)
+            # 将视觉识别结果作为上下文
+            context_msg = f"用户上传了一张图片（{filename}），视觉模型识别结果：\n{vision_result}\n\n用户问题：{prompt}"
+        else:
+            # 文档：提取文字
+            extracted = await self._extract_text_from_file(file_data, file_type, filename)
+            context_msg = f"用户上传了文件（{filename}），内容如下：\n\n{extracted}\n\n用户问题：{message or '请总结这份文件'}"
+
+        # 调用文本 LLM
+        llm = self.build_llm(model)
+        messages = [SystemMessage(content=system_prompt)]
+        messages.extend(memory.chat_memory.messages)
+        messages.append(HumanMessage(content=context_msg))
+
+        response_text = ""
+        try:
+            async for chunk in llm.astream(messages):
+                content = chunk.content
+                if isinstance(content, str):
+                    response_text += content
+        except Exception:
+            # 降级：使用非流式调用
+            result = await llm.ainvoke(messages)
+            response_text = result.content if hasattr(result, "content") else str(result)
+
+        if not response_text:
+            response_text = vision_result if file_type == "image" else "文件已处理，但模型未返回有效回复。"
+
+        await self._sessions.save_message(session_id, "assistant", response_text, role)
+        self._sessions.save_context(session_id, role, user_content, response_text)
+
+        return {"response": response_text, "session_id": session_id}
 
     # ------------------------------------------------------------------
     # 可用模型列表

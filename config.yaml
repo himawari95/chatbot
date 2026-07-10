@@ -44,6 +44,13 @@ llm:
   max_retries: 3        # 最大重试次数（0 = 不重试）
   retry_backoff: 2      # 退避因子（1s, 2s, 4s...）
 
+# --- 多模态 / 视觉模型配置 ---
+vision:
+  enabled: true
+  model: "qwen-vl-plus"      # 通义千问 VL 视觉模型
+  provider: "dashscope"
+  max_file_size_mb: 10       # 文件大小限制（MB）
+
 # --- Gradio UI 配置 ---
 ui:
   host: "127.0.0.1"

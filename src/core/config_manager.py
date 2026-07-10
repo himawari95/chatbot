@@ -229,6 +229,34 @@ class ConfigManager:
         return None
 
     # ------------------------------------------------------------------
+    # 多模态 / 视觉模型配置
+    # ------------------------------------------------------------------
+
+    @property
+    def vision_enabled(self) -> bool:
+        return self._global_config.get("vision", {}).get("enabled", True)
+
+    @property
+    def vision_model(self) -> str:
+        return self._global_config.get("vision", {}).get("model", "qwen-vl-plus")
+
+    @property
+    def vision_max_file_size_mb(self) -> int:
+        return self._global_config.get("vision", {}).get("max_file_size_mb", 10)
+
+    def get_vision_model_config(self) -> dict | None:
+        """获取视觉模型配置（API Key + Base URL）"""
+        vision = self._global_config.get("vision", {})
+        provider = vision.get("provider", "dashscope")
+        if provider == "dashscope":
+            return {
+                "api_key": self.get_env("DASHSCOPE_API_KEY"),
+                "base_url": self.get_env("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+                "model": vision.get("model", "qwen-vl-plus"),
+            }
+        return None
+
+    # ------------------------------------------------------------------
     # UI 配置
     # ------------------------------------------------------------------
 
