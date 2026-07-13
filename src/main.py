@@ -536,16 +536,13 @@ def run_backend():
 
 def run_ui():
     """独立启动 Gradio 前端"""
-    from src.ui.web.app import _demo
+    from src.ui.web.app import GLASS_CSS, _demo
     _demo.launch(
         server_name=_config.ui_host,
         server_port=_config.ui_port,
         share=_config.ui_share,
         show_error=True,
-        css="""
-            footer { display: none !important; }
-            #status-row { align-items: center; }
-        """,
+        css=GLASS_CSS,
     )
 
 

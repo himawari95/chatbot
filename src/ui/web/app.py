@@ -1074,14 +1074,16 @@ async def parallel_chat_respond(
 ):
     """并行多模型聊天处理器 — 逐模型流式输出"""
     empty = (gr.update(visible=False, value=""),) * 4
+    show_placeholder = gr.update(visible=True)
+    hide_placeholder = gr.update(visible=False)
     if not message.strip():
-        yield (*empty, gr.update())
+        yield (*empty, gr.update(), show_placeholder)
         return
     if not user_id:
-        yield (*empty, gr.update())
+        yield (*empty, gr.update(), show_placeholder)
         return
     if len(models) < 2:
-        yield (*empty, gr.update())
+        yield (*empty, gr.update(), show_placeholder)
         return
     if not session_id:
         session = await _create_session_api(user_id, role, models[0])
@@ -1122,8 +1124,8 @@ async def parallel_chat_respond(
             results.append(gr.update(visible=False, value=""))
         return tuple(results)
 
-    # 初始渲染
-    yield (*_render(), gr.update(interactive=False))
+    # 初始渲染 — 隐藏占位提示
+    yield (*_render(), gr.update(interactive=False), hide_placeholder)
 
     try:
         async for event in _parallel_stream_tokens(message, session_id, model_names, user_id, role):
@@ -1134,24 +1136,24 @@ async def parallel_chat_respond(
                 continue
             if "content" in event:
                 buffers[model] += event["content"]
-                yield (*_render(), gr.update(interactive=False))
+                yield (*_render(), gr.update(interactive=False), hide_placeholder)
             elif event.get("done"):
                 done_models.add(model)
                 if "duration" in event:
                     durations[model] = str(event["duration"])
                 if "error" in event:
                     errors[model] = event["error"]
-                yield (*_render(), gr.update(interactive=False))
+                yield (*_render(), gr.update(interactive=False), hide_placeholder)
 
     except Exception as e:
         for m in model_names:
             if m not in done_models and m not in errors:
                 errors[m] = str(e)
                 done_models.add(m)
-        yield (*_render(), gr.update(interactive=True))
+        yield (*_render(), gr.update(interactive=True), hide_placeholder)
         return
 
-    yield (*_render(), gr.update(interactive=True))
+    yield (*_render(), gr.update(interactive=True), hide_placeholder)
 
 
 def on_startup():
@@ -1173,68 +1175,280 @@ def on_startup():
 # =============================================================================
 
 
-def build_ui() -> gr.Blocks:
-    """构建 Gradio 界面"""
-    with gr.Blocks(title="Chatbot — LangChain Chat v1.1") as demo:
+# =============================================================================
+# 毛玻璃清新风格 CSS（模块级常量，供 build_ui 和 run_ui 共用）
+# =============================================================================
 
-        # --- 状态 ---
+GLASS_CSS = """
+/* ============================================================
+   全局 — 毛玻璃清新风格
+   ============================================================ */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+.gradio-container {
+    max-width: 100% !important;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif !important;
+    background: linear-gradient(135deg, #e8f0fe 0%, #f3e8ff 50%, #fce4ec 100%) !important;
+    min-height: 100vh !important;
+}
+body {
+    background: linear-gradient(135deg, #e8f0fe 0%, #f3e8ff 50%, #fce4ec 100%) !important;
+}
+
+/* ---- 主容器 ---- */
+.contain, .app, .main-header, .gr-box {
+    background: rgba(255,255,255,0.45) !important;
+    backdrop-filter: blur(16px) !important;
+    -webkit-backdrop-filter: blur(16px) !important;
+    border: 1px solid rgba(255,255,255,0.3) !important;
+    border-radius: 16px !important;
+    box-shadow: 0 8px 32px rgba(99,102,241,0.08) !important;
+}
+
+/* ---- 页头 ---- */
+h1, .app h1 {
+    background: linear-gradient(135deg, #6366f1, #a855f7) !important;
+    -webkit-background-clip: text !important;
+    -webkit-text-fill-color: transparent !important;
+    background-clip: text !important;
+    font-weight: 700 !important;
+    font-size: 2rem !important;
+}
+
+/* ---- 按钮 ---- */
+.gr-button-primary, button.primary {
+    background: linear-gradient(135deg, #6366f1, #8b5cf6) !important;
+    color: #fff !important;
+    border: none !important;
+    border-radius: 12px !important;
+    font-weight: 600 !important;
+    transition: all 0.2s ease !important;
+    box-shadow: 0 4px 15px rgba(99,102,241,0.3) !important;
+}
+.gr-button-primary:hover, button.primary:hover {
+    transform: scale(1.02) !important;
+    box-shadow: 0 6px 20px rgba(99,102,241,0.4) !important;
+}
+.gr-button-secondary, button.secondary {
+    background: rgba(255,255,255,0.55) !important;
+    backdrop-filter: blur(12px) !important;
+    -webkit-backdrop-filter: blur(12px) !important;
+    color: #4a4a6a !important;
+    border: 1px solid rgba(255,255,255,0.3) !important;
+    border-radius: 12px !important;
+    font-weight: 500 !important;
+    transition: all 0.2s ease !important;
+}
+.gr-button-secondary:hover {
+    background: rgba(255,255,255,0.7) !important;
+    border-color: rgba(99,102,241,0.3) !important;
+}
+button[class*="stop"], .gr-button-stop {
+    background: linear-gradient(135deg, #f43f5e, #e11d48) !important;
+    color: #fff !important;
+    border: none !important;
+    border-radius: 12px !important;
+    font-weight: 600 !important;
+}
+
+/* ---- 输入框 ---- */
+textarea, input[type="text"], .gr-textbox textarea, .gr-textbox input {
+    background: rgba(255,255,255,0.5) !important;
+    backdrop-filter: blur(8px) !important;
+    -webkit-backdrop-filter: blur(8px) !important;
+    border: 1px solid rgba(255,255,255,0.3) !important;
+    border-radius: 12px !important;
+    padding: 12px 16px !important;
+    font-size: 15px !important;
+    color: #1a1a2e !important;
+}
+textarea:focus, input[type="text"]:focus {
+    border-color: rgba(99,102,241,0.5) !important;
+    box-shadow: 0 0 0 3px rgba(99,102,241,0.1) !important;
+    outline: none !important;
+}
+
+/* ---- 下拉菜单 ---- */
+.gr-dropdown, select, .wrap-inner {
+    background: rgba(255,255,255,0.5) !important;
+    backdrop-filter: blur(12px) !important;
+    -webkit-backdrop-filter: blur(12px) !important;
+    border: 1px solid rgba(255,255,255,0.3) !important;
+    border-radius: 12px !important;
+}
+.options, .gr-dropdown .options {
+    background: rgba(255,255,255,0.85) !important;
+    backdrop-filter: blur(20px) !important;
+    -webkit-backdrop-filter: blur(20px) !important;
+    border: 1px solid rgba(255,255,255,0.3) !important;
+    border-radius: 12px !important;
+    box-shadow: 0 8px 32px rgba(99,102,241,0.12) !important;
+}
+
+/* ---- 聊天气泡 ---- */
+.chatbot .message, .bubble-wrap {
+    border-radius: 20px !important;
+    margin: 8px 0 !important;
+    animation: fadeInUp 0.3s ease !important;
+}
+.chatbot .user, .user .bubble-wrap, .message.user {
+    background: linear-gradient(135deg, #6366f1, #8b5cf6) !important;
+    color: #fff !important;
+    border-radius: 20px 20px 4px 20px !important;
+    padding: 14px 18px !important;
+    box-shadow: 0 4px 15px rgba(99,102,241,0.25) !important;
+}
+.chatbot .bot, .bot .bubble-wrap, .message.bot {
+    background: rgba(255,255,255,0.6) !important;
+    backdrop-filter: blur(8px) !important;
+    -webkit-backdrop-filter: blur(8px) !important;
+    color: #1a1a2e !important;
+    border-radius: 20px 20px 20px 4px !important;
+    padding: 14px 18px !important;
+    border: 1px solid rgba(255,255,255,0.3) !important;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.04) !important;
+}
+.chatbot { background: transparent !important; border: none !important; }
+.message-wrap { background: transparent !important; }
+
+/* ---- Accordion ---- */
+.gr-accordion, .accordion {
+    background: rgba(255,255,255,0.45) !important;
+    backdrop-filter: blur(12px) !important;
+    -webkit-backdrop-filter: blur(12px) !important;
+    border: 1px solid rgba(255,255,255,0.3) !important;
+    border-radius: 16px !important;
+}
+
+/* ---- 文件上传 ---- */
+.gr-file, .file-preview {
+    background: rgba(255,255,255,0.45) !important;
+    backdrop-filter: blur(12px) !important;
+    border: 2px dashed rgba(99,102,241,0.25) !important;
+    border-radius: 16px !important;
+}
+.gr-file:hover { border-color: rgba(99,102,241,0.5) !important; }
+
+/* ---- 滚动条 ---- */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(99,102,241,0.3); border-radius: 4px; }
+
+/* ---- 动画 ---- */
+@keyframes fadeInUp {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+@keyframes pulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(239,68,68,0.4); }
+    50% { box-shadow: 0 0 0 8px rgba(239,68,68,0); }
+}
+
+/* ---- 底部栏 ---- */
+footer, .footer {
+    background: rgba(255,255,255,0.5) !important;
+    backdrop-filter: blur(16px) !important;
+    -webkit-backdrop-filter: blur(16px) !important;
+    border-top: 1px solid rgba(255,255,255,0.3) !important;
+}
+
+/* ---- 标签 ---- */
+label, .gr-label { color: #4a4a6a !important; font-weight: 500 !important; font-size: 13px !important; }
+
+/* ---- 面板 ---- */
+.gr-panel { background: transparent !important; border: none !important; }
+.gr-row, .gr-column { gap: 8px !important; }
+
+/* ---- 隐藏页脚 ---- */
+footer.gr-footer { display: none !important; }
+
+/* ---- 语音录音动画 ---- */
+#voice-mic-btn[style*="background: rgb(239, 68, 68)"] { animation: pulse 1.5s infinite !important; }
+
+/* ---- 上传按钮 ---- */
+.gr-upload-button { border-radius: 12px !important; min-height: 40px !important; }
+.gr-upload-button:hover { background: rgba(255,255,255,0.7) !important; border-color: rgba(99,102,241,0.4) !important; }
+
+/* ---- 多模型对比网格卡片 ---- */
+.parallel-compare {
+    background: rgba(255,255,255,0.35) !important;
+    backdrop-filter: blur(12px) !important;
+    -webkit-backdrop-filter: blur(12px) !important;
+    border: 1px solid rgba(255,255,255,0.3) !important;
+    border-radius: 16px !important;
+    padding: 12px !important;
+    margin: 8px 0 !important;
+}
+.parallel-card {
+    min-height: 300px !important;
+    max-height: 400px !important;
+    overflow-y: auto !important;
+    background: rgba(255,255,255,0.5) !important;
+    border: 1px solid rgba(99,102,241,0.15) !important;
+    border-radius: 12px !important;
+    padding: 12px !important;
+}
+
+/* ---- 多模型对比面板 ---- */
+.gr-accordion { margin-top: 8px !important; }
+
+/* ---- 两栏布局响应式 ---- */
+@media (max-width: 768px) {
+    .gradio-container .gr-row > .gr-column:nth-child(1) { display: none !important; }
+}
+"""
+
+
+def build_ui() -> gr.Blocks:
+    """构建 Gradio 界面（清新毛玻璃风格 / 两栏布局 + 顶部工具栏）"""
+    with gr.Blocks(title="Chatbot — Glass Edition", theme=gr.themes.Soft(), css=GLASS_CSS) as demo:
+
+        # ================================================================
+        # 状态变量
+        # ================================================================
         session_state = gr.State("")
         user_state = gr.State(None)
         username_state = gr.State("")
         role_state = gr.State("default")
         delete_pending_state = gr.State(False)
         session_delete_pending_state = gr.State(False)
-        preset_edit_mode = gr.State("none")      # "none" | "create" | "edit"
+        preset_edit_mode = gr.State("none")
         preset_edit_id = gr.State(None)
         preset_delete_pending = gr.State(False)
 
-        # --- 页头 ---
-        gr.Markdown("# 🤖 Chatbot")
-        status_md = gr.Markdown("⏳ 正在检查后端...")
-        user_md = gr.Markdown("### ⚠️ 请先登录")
+        # ================================================================
+        # 状态指示
+        # ================================================================
+        status_md = gr.Markdown("⏳ 正在检查后端...", visible=False)
+        user_md = gr.Markdown("### ⚠️ 请先登录", visible=False)
 
-        # --- 语音输入按钮（HTML）---
+        # ================================================================
+        # 语音模块注入（隐藏）
+        # ================================================================
         voice_mic_html = gr.HTML(
-            value="""
-            <button id="voice-mic-btn" style="
-                width:100%; padding:8px 16px; font-size:14px; cursor:pointer;
-                border:1px solid #d1d5db; border-radius:6px; background:#f9fafb;
-                color:#374151; transition:all 0.2s;
-            " onmouseover="this.style.background='#f3f4f6'" onmouseout="this.style.background='#f9fafb'">
-                🎤 语音输入
-            </button>
-            """,
-            visible=True,
+            value="",
+            visible=False,
             head=f"""<script>
 {_VOICE_JS_CONTENT}
-
-// ---- 麦克风按钮事件绑定 ----
 (function() {{
     function bindMic() {{
         var btn = document.getElementById('voice-mic-btn');
         if (!btn) {{ setTimeout(bindMic, 200); return; }}
-        btn.addEventListener('click', function() {{
-            window.toggleVoiceInput();
-        }});
+        btn.addEventListener('click', function() {{ window.toggleVoiceInput(); }});
     }}
     bindMic();
 }})();
-
-// ---- 助手消息播放按钮观察器 ----
 (function() {{
     var apiBase = '{BACKEND_URL}';
     var observer = new MutationObserver(function() {{
-        var bots = document.querySelectorAll('.bot');
-        if (!bots.length) return;
-        bots.forEach(function(bot) {{
+        document.querySelectorAll('.bot').forEach(function(bot) {{
             if (bot.querySelector('.voice-play-btn')) return;
             var btn = document.createElement('button');
             btn.className = 'voice-play-btn';
-            btn.textContent = '🔊';
-            btn.title = '播放语音';
+            btn.textContent = '🔊'; btn.title = '播放语音';
             btn.style.cssText = 'margin:2px 0;padding:1px 6px;font-size:11px;cursor:pointer;border:1px solid #ccc;border-radius:3px;background:#f5f5f5;float:right;';
             btn.onclick = function() {{
-                var text = bot.textContent.replace('🔊', '').trim();
+                var text = bot.textContent.replace('🔊','').trim();
                 if (text) window.playTTS(text, apiBase);
             }};
             bot.appendChild(btn);
@@ -1244,160 +1458,163 @@ def build_ui() -> gr.Blocks:
 }})();
 </script>""")
 
-        # --- 登录行 ---
-        with gr.Row(equal_height=True):
-            login_box = gr.Textbox(
-                placeholder="输入用户名...",
-                label="用户名",
-                scale=4,
-                container=False,
-            )
-            login_btn = gr.Button("登录 / 切换", scale=1, variant="primary", size="sm")
-            delete_user_btn = gr.Button("🗑 删除用户", scale=1, variant="stop", size="sm")
+        # ================================================================
+        # 登录卡片
+        # ================================================================
+        gr.Markdown("<div style='text-align:center;margin-top:60px'><h1>🤖 Chatbot</h1></div>")
+        with gr.Column(scale=1, min_width=360):
+            with gr.Group():
+                login_box = gr.Textbox(
+                    placeholder="输入用户名...",
+                    label="用户名",
+                    container=True,
+                )
+                with gr.Row():
+                    login_btn = gr.Button("登录 / 切换", variant="primary")
+                    delete_user_btn = gr.Button("🗑 删除用户", variant="stop")
 
-        # --- 控制行 ---
-        with gr.Row(equal_height=True):
+        # ================================================================
+        # 顶部工具栏（全宽，一行）
+        # ================================================================
+        with gr.Row():
+            search_box = gr.Textbox(
+                placeholder="🔍 搜索历史消息...",
+                label="",
+                scale=10,
+            )
+            search_btn = gr.Button("🔍", variant="secondary", scale=1, min_width=48)
             model_dd = gr.Dropdown(
-                label="模型",
                 choices=["deepseek-chat"],
                 value="deepseek-chat",
-                scale=2,
-                interactive=True,
+                label="模型",
+                scale=3,
             )
             role_dd = gr.Dropdown(
                 label="🎭 角色",
                 choices=ROLE_OPTIONS,
                 value="default",
-                scale=2,
-                interactive=True,
-            )
-            session_dd = gr.Dropdown(
-                label="会话",
-                choices=[],
-                value=None,
                 scale=3,
-                interactive=True,
             )
-            new_btn = gr.Button("＋ 新会话", scale=1, variant="secondary", size="sm")
-            export_btn = gr.Button("📥 导出", scale=1, variant="secondary", size="sm")
-            del_btn = gr.Button("🗑", scale=0, variant="stop", size="sm", min_width=40)
-            cancel_del_btn = gr.Button("取消", scale=0, variant="secondary", size="sm", visible=False)
+            export_btn = gr.Button("📥 导出", variant="secondary", scale=2, min_width=80)
+            new_btn = gr.Button("＋ 新建会话", variant="primary", scale=2, min_width=100)
 
-        # --- 重命名行 ---
-        with gr.Row(equal_height=True):
-            rename_box = gr.Textbox(
-                placeholder="输入新标题...",
-                label="重命名",
-                scale=4,
-                container=False,
-            )
-            rename_btn = gr.Button("✏️ 重命名", scale=1, variant="secondary", size="sm")
-
-        # --- 导出状态 ---
+        search_results_md = gr.Markdown("")
         export_status_md = gr.Markdown("")
 
-        # --- 并行多模型对比 ---
-        with gr.Accordion("🔀 多模型并行对比", open=False):
-            with gr.Row(equal_height=True):
-                parallel_models_cbg = gr.CheckboxGroup(
-                    label="选择模型（至少 2 个）",
-                    choices=["deepseek-chat"],
-                    value=[],
-                    scale=4,
-                )
-                parallel_send_btn = gr.Button("🚀 并行发送", scale=1, variant="primary", size="sm")
-            parallel_msg_box = gr.Textbox(
-                placeholder="输入消息，Enter 发送到所有选中模型...",
-                label="并行提问",
-                container=False,
-            )
-            # 4 个模型输出区域（2x2 网格）
-            with gr.Row(equal_height=False):
-                parallel_md1 = gr.Markdown("", visible=False)
-                parallel_md2 = gr.Markdown("", visible=False)
-            with gr.Row(equal_height=False):
-                parallel_md3 = gr.Markdown("", visible=False)
-                parallel_md4 = gr.Markdown("", visible=False)
+        # ================================================================
+        # 主界面（两栏布局）
+        # ================================================================
+        with gr.Row(equal_height=False):
 
-        # --- 预设管理按钮 ---
-        with gr.Row(equal_height=True):
-            preset_mgmt_btn = gr.Button("⚙️ 预设管理", scale=1, variant="secondary", size="sm")
+            # ========== 左侧面板 (1) ==========
+            with gr.Column(scale=1, min_width=220):
+                gr.Markdown("### 👤 用户")
 
-        # --- 预设管理区域（默认隐藏）---
-        with gr.Group(visible=False) as preset_mgmt_group:
-            gr.Markdown("### 🎭 预设管理")
-            with gr.Row(equal_height=True):
-                preset_list_dd = gr.Dropdown(
-                    label="我的预设",
+                gr.Markdown("### 💬 会话")
+                session_dd = gr.Dropdown(
+                    label="",
                     choices=[],
                     value=None,
-                    scale=4,
                     interactive=True,
                 )
-                preset_add_btn = gr.Button("➕ 新增", scale=1, variant="primary", size="sm")
-                preset_edit_btn = gr.Button("✏️ 编辑", scale=1, variant="secondary", size="sm")
-                preset_del_btn = gr.Button("🗑 删除", scale=1, variant="stop", size="sm")
+                with gr.Row():
+                    del_btn = gr.Button("🗑", variant="stop", size="sm", min_width=40)
+                    cancel_del_btn = gr.Button("取消", variant="secondary", size="sm", visible=False)
+                with gr.Row():
+                    rename_box = gr.Textbox(placeholder="重命名...", label="", container=False, scale=4)
+                    rename_btn = gr.Button("✏️", variant="secondary", size="sm", scale=0, min_width=40)
 
-            # 删除确认按钮
-            preset_del_confirm_btn = gr.Button("⚠️ 确认删除", variant="stop", size="sm", visible=False)
+                preset_mgmt_btn = gr.Button("⚙️ 预设管理", variant="secondary", size="sm")
+                with gr.Group(visible=False) as preset_mgmt_group:
+                    preset_list_dd = gr.Dropdown(label="我的预设", choices=[], value=None)
+                    with gr.Row():
+                        preset_add_btn = gr.Button("➕ 新增", variant="primary", size="sm")
+                        preset_edit_btn = gr.Button("✏️ 编辑", variant="secondary", size="sm")
+                        preset_del_btn = gr.Button("🗑 删除", variant="stop", size="sm")
+                    preset_del_confirm_btn = gr.Button("⚠️ 确认删除", variant="stop", size="sm", visible=False)
+                    with gr.Group(visible=False) as preset_form_group:
+                        preset_name_box = gr.Textbox(label="预设名称")
+                        preset_desc_box = gr.Textbox(label="描述")
+                        preset_prompt_box = gr.Textbox(label="System Prompt", lines=4)
+                        with gr.Row():
+                            preset_save_btn = gr.Button("💾 保存", variant="primary")
+                            preset_cancel_btn = gr.Button("❌ 取消", variant="secondary")
 
-            # 新增/编辑表单
-            with gr.Group(visible=False) as preset_form_group:
-                preset_name_box = gr.Textbox(label="预设名称", placeholder="输入预设名称...")
-                preset_desc_box = gr.Textbox(label="描述", placeholder="简短描述...")
-                preset_prompt_box = gr.Textbox(
-                    label="System Prompt",
-                    placeholder="输入系统提示词...",
-                    lines=4,
+            # ========== 中间主区域 (4) ==========
+            with gr.Column(scale=4, min_width=400):
+                chatbot = gr.Chatbot(
+                    height=520,
+                    avatar_images=(USER_AVATAR, BOT_AVATAR),
+                    label="",
                 )
-                with gr.Row(equal_height=True):
-                    preset_save_btn = gr.Button("💾 保存", variant="primary", scale=1)
-                    preset_cancel_btn = gr.Button("❌ 取消", variant="secondary", scale=1)
 
-        # --- 聊天显示区 ---
-        chatbot = gr.Chatbot(
-            height=520,
-            avatar_images=(USER_AVATAR, BOT_AVATAR),
-            label="",
-        )
+                token_md = gr.Markdown("")
 
-        # --- Token 用量显示 ---
-        token_md = gr.Markdown("")
+                # 多模型并行对比（中下区域板块）
+                with gr.Group(elem_classes="parallel-compare"):
+                    gr.Markdown("### 🔀 多模型并行对比")
+                    with gr.Row():
+                        parallel_models_cbg = gr.CheckboxGroup(
+                            label="选择模型",
+                            choices=["deepseek-chat"],
+                            value=[],
+                            scale=3,
+                        )
+                        parallel_msg_box = gr.Textbox(
+                            placeholder="输入消息，发送到所有选中模型...",
+                            label="并行提问",
+                            scale=5,
+                            container=False,
+                        )
+                        parallel_send_btn = gr.Button("🚀 发送", variant="primary", scale=1, min_width=80)
+                    parallel_placeholder = gr.Markdown(
+                        "> 💡 请选择至少 2 个模型进行对比",
+                        visible=True,
+                    )
+                    with gr.Row():
+                        with gr.Column(scale=1, min_width=200):
+                            parallel_md1 = gr.Markdown("", visible=False, elem_classes="parallel-card")
+                        with gr.Column(scale=1, min_width=200):
+                            parallel_md2 = gr.Markdown("", visible=False, elem_classes="parallel-card")
+                    with gr.Row():
+                        with gr.Column(scale=1, min_width=200):
+                            parallel_md3 = gr.Markdown("", visible=False, elem_classes="parallel-card")
+                        with gr.Column(scale=1, min_width=200):
+                            parallel_md4 = gr.Markdown("", visible=False, elem_classes="parallel-card")
 
-        # --- 输入行 ---
-        with gr.Row(equal_height=True):
-            msg_box = gr.Textbox(
-                placeholder="输入消息，Enter 发送...",
-                label="",
-                scale=10,
-                container=False,
-            )
-            file_upload = gr.File(
-                label="",
-                scale=2,
-                file_count="single",
-                file_types=[".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".pdf", ".docx", ".txt"],
-            )
-            send_btn = gr.Button("发送", scale=1, variant="primary")
+                with gr.Row():
+                    file_upload = gr.UploadButton(
+                        "📎",
+                        file_count="single",
+                        file_types=[".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".pdf", ".docx", ".txt"],
+                        scale=0,
+                        min_width=48,
+                    )
+                    voice_btn_html = gr.HTML(
+                        value="""<button id="voice-mic-btn" style="
+                            width:100%;height:100%;font-size:18px;cursor:pointer;
+                            border:1px solid rgba(0,0,0,0.1);border-radius:8px;
+                            background:rgba(255,255,255,0.5);color:#374151;
+                            transition:all 0.2s;min-height:40px;
+                        " onmouseover="this.style.background='rgba(255,255,255,0.7)'" onmouseout="this.style.background='rgba(255,255,255,0.5)'">
+                            🎤
+                        </button>""",
+                        scale=0,
+                        min_width=52,
+                    )
+                    msg_box = gr.Textbox(
+                        placeholder="输入消息，Enter 发送...",
+                        label="",
+                        scale=8,
+                        container=False,
+                    )
+                    send_btn = gr.Button("发送", variant="primary", scale=1)
 
-        # --- 快捷提问 ---
-        gr.Examples(
-            examples=["你好，介绍一下自己", "用 Python 写一个快速排序", "推荐三本科幻小说"],
-            inputs=[msg_box],
-            label="快捷提问",
-        )
-
-        # --- 搜索 ---
-        with gr.Accordion("🔍 对话搜索", open=False):
-            with gr.Row(equal_height=True):
-                search_box = gr.Textbox(
-                    placeholder="输入关键词搜索历史消息...",
-                    label="关键词",
-                    scale=4,
-                    container=False,
+                gr.Examples(
+                    examples=["你好，介绍一下自己", "用 Python 写一个快速排序", "推荐三本科幻小说"],
+                    inputs=[msg_box],
+                    label="快捷提问",
                 )
-                search_btn = gr.Button("搜索", scale=1, variant="primary", size="sm")
-            search_results_md = gr.Markdown("")
 
         # ================================================================
         # 事件绑定
@@ -1569,13 +1786,13 @@ def build_ui() -> gr.Blocks:
         parallel_send_btn.click(
             parallel_chat_respond,
             inputs=[parallel_msg_box, parallel_models_cbg, session_state, user_state, role_state],
-            outputs=[parallel_md1, parallel_md2, parallel_md3, parallel_md4, parallel_send_btn],
+            outputs=[parallel_md1, parallel_md2, parallel_md3, parallel_md4, parallel_send_btn, parallel_placeholder],
         )
 
         parallel_msg_box.submit(
             parallel_chat_respond,
             inputs=[parallel_msg_box, parallel_models_cbg, session_state, user_state, role_state],
-            outputs=[parallel_md1, parallel_md2, parallel_md3, parallel_md4, parallel_send_btn],
+            outputs=[parallel_md1, parallel_md2, parallel_md3, parallel_md4, parallel_send_btn, parallel_placeholder],
         )
 
         # --- 搜索事件 ---
@@ -1606,8 +1823,5 @@ if __name__ == "__main__":
         server_port=7860,
         share=False,
         show_error=True,
-        css="""
-            footer { display: none !important; }
-            #status-row { align-items: center; }
-        """,
+        css=GLASS_CSS,
     )
