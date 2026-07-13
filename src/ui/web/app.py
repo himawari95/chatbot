@@ -1369,28 +1369,36 @@ footer.gr-footer { display: none !important; }
 .gr-upload-button { border-radius: 12px !important; min-height: 40px !important; }
 .gr-upload-button:hover { background: rgba(255,255,255,0.7) !important; border-color: rgba(99,102,241,0.4) !important; }
 
-/* ---- 多模型对比网格卡片 ---- */
-.parallel-compare {
-    background: rgba(255,255,255,0.35) !important;
-    backdrop-filter: blur(12px) !important;
-    -webkit-backdrop-filter: blur(12px) !important;
-    border: 1px solid rgba(255,255,255,0.3) !important;
-    border-radius: 16px !important;
-    padding: 12px !important;
-    margin: 8px 0 !important;
-}
+/* ---- 多模型对比结果卡片 ---- */
 .parallel-card {
-    min-height: 300px !important;
-    max-height: 400px !important;
+    min-height: 200px !important;
+    max-height: 350px !important;
     overflow-y: auto !important;
-    background: rgba(255,255,255,0.5) !important;
+    background: rgba(255,255,255,0.55) !important;
     border: 1px solid rgba(99,102,241,0.15) !important;
     border-radius: 12px !important;
     padding: 12px !important;
 }
 
-/* ---- 多模型对比面板 ---- */
-.gr-accordion { margin-top: 8px !important; }
+/* ---- 底部并行对比折叠面板 ---- */
+.parallel-accordion {
+    margin: 0 !important;
+    border-top: 1px solid rgba(255,255,255,0.3) !important;
+    border-radius: 0 !important;
+    background: rgba(255,255,255,0.45) !important;
+    backdrop-filter: blur(12px) !important;
+    -webkit-backdrop-filter: blur(12px) !important;
+}
+
+/* ---- Token 统计栏 ---- */
+.token-bar {
+    padding: 4px 16px !important;
+    background: rgba(255,255,255,0.45) !important;
+    backdrop-filter: blur(12px) !important;
+    -webkit-backdrop-filter: blur(12px) !important;
+    border-top: 1px solid rgba(255,255,255,0.3) !important;
+    margin: 0 !important;
+}
 
 /* ---- 两栏布局响应式 ---- */
 @media (max-width: 768px) {
@@ -1412,7 +1420,7 @@ def build_ui() -> gr.Blocks:
         role_state = gr.State("default")
         delete_pending_state = gr.State(False)
         session_delete_pending_state = gr.State(False)
-        preset_edit_mode = gr.State("none")
+        preset_edit_mode = gr.State("create")
         preset_edit_id = gr.State(None)
         preset_delete_pending = gr.State(False)
 
@@ -1427,21 +1435,31 @@ def build_ui() -> gr.Blocks:
         # ================================================================
         voice_mic_html = gr.HTML(
             value="",
-            visible=False,
+            visible=True,
             head=f"""<script>
 {_VOICE_JS_CONTENT}
+// 用 MutationObserver 监听 #voice-mic-btn 的出现，比轮询更可靠
 (function() {{
-    function bindMic() {{
+    var micObserver = new MutationObserver(function() {{
         var btn = document.getElementById('voice-mic-btn');
-        if (!btn) {{ setTimeout(bindMic, 200); return; }}
+        if (btn && !btn._voiceBound) {{
+            btn._voiceBound = true;
+            btn.addEventListener('click', function() {{ window.toggleVoiceInput(); }});
+        }}
+    }});
+    micObserver.observe(document.body, {{ childList: true, subtree: true }});
+    // 同时立即尝试绑定（按钮可能已存在）
+    var btn = document.getElementById('voice-mic-btn');
+    if (btn) {{
+        btn._voiceBound = true;
         btn.addEventListener('click', function() {{ window.toggleVoiceInput(); }});
     }}
-    bindMic();
 }})();
+// TTS 播放按钮注入
 (function() {{
     var apiBase = '{BACKEND_URL}';
     var observer = new MutationObserver(function() {{
-        document.querySelectorAll('.bot').forEach(function(bot) {{
+        document.querySelectorAll('.message.bot, .bot').forEach(function(bot) {{
             if (bot.querySelector('.voice-play-btn')) return;
             var btn = document.createElement('button');
             btn.className = 'voice-play-btn';
@@ -1525,14 +1543,14 @@ def build_ui() -> gr.Blocks:
                     rename_btn = gr.Button("✏️", variant="secondary", size="sm", scale=0, min_width=40)
 
                 preset_mgmt_btn = gr.Button("⚙️ 预设管理", variant="secondary", size="sm")
-                with gr.Group(visible=False) as preset_mgmt_group:
+                with gr.Group(visible=True) as preset_mgmt_group:
                     preset_list_dd = gr.Dropdown(label="我的预设", choices=[], value=None)
                     with gr.Row():
                         preset_add_btn = gr.Button("➕ 新增", variant="primary", size="sm")
                         preset_edit_btn = gr.Button("✏️ 编辑", variant="secondary", size="sm")
                         preset_del_btn = gr.Button("🗑 删除", variant="stop", size="sm")
                     preset_del_confirm_btn = gr.Button("⚠️ 确认删除", variant="stop", size="sm", visible=False)
-                    with gr.Group(visible=False) as preset_form_group:
+                    with gr.Group(visible=True) as preset_form_group:
                         preset_name_box = gr.Textbox(label="预设名称")
                         preset_desc_box = gr.Textbox(label="描述")
                         preset_prompt_box = gr.Textbox(label="System Prompt", lines=4)
@@ -1547,40 +1565,6 @@ def build_ui() -> gr.Blocks:
                     avatar_images=(USER_AVATAR, BOT_AVATAR),
                     label="",
                 )
-
-                token_md = gr.Markdown("")
-
-                # 多模型并行对比（中下区域板块）
-                with gr.Group(elem_classes="parallel-compare"):
-                    gr.Markdown("### 🔀 多模型并行对比")
-                    with gr.Row():
-                        parallel_models_cbg = gr.CheckboxGroup(
-                            label="选择模型",
-                            choices=["deepseek-chat"],
-                            value=[],
-                            scale=3,
-                        )
-                        parallel_msg_box = gr.Textbox(
-                            placeholder="输入消息，发送到所有选中模型...",
-                            label="并行提问",
-                            scale=5,
-                            container=False,
-                        )
-                        parallel_send_btn = gr.Button("🚀 发送", variant="primary", scale=1, min_width=80)
-                    parallel_placeholder = gr.Markdown(
-                        "> 💡 请选择至少 2 个模型进行对比",
-                        visible=True,
-                    )
-                    with gr.Row():
-                        with gr.Column(scale=1, min_width=200):
-                            parallel_md1 = gr.Markdown("", visible=False, elem_classes="parallel-card")
-                        with gr.Column(scale=1, min_width=200):
-                            parallel_md2 = gr.Markdown("", visible=False, elem_classes="parallel-card")
-                    with gr.Row():
-                        with gr.Column(scale=1, min_width=200):
-                            parallel_md3 = gr.Markdown("", visible=False, elem_classes="parallel-card")
-                        with gr.Column(scale=1, min_width=200):
-                            parallel_md4 = gr.Markdown("", visible=False, elem_classes="parallel-card")
 
                 with gr.Row():
                     file_upload = gr.UploadButton(
@@ -1615,6 +1599,44 @@ def build_ui() -> gr.Blocks:
                     inputs=[msg_box],
                     label="快捷提问",
                 )
+
+        # ================================================================
+        # 底部：多模型并行对比（整行横条，可折叠）
+        # ================================================================
+        with gr.Accordion("📊 多模型并行对比", open=True, elem_classes="parallel-accordion"):
+            with gr.Row():
+                parallel_models_cbg = gr.CheckboxGroup(
+                    label="选择模型（至少 2 个）",
+                    choices=["deepseek-chat"],
+                    value=[],
+                    scale=3,
+                )
+                parallel_msg_box = gr.Textbox(
+                    placeholder="输入消息，发送到所有选中模型...",
+                    label="并行提问",
+                    scale=5,
+                    container=False,
+                )
+                parallel_send_btn = gr.Button("🚀 发送", variant="primary", scale=1, min_width=80)
+            parallel_placeholder = gr.Markdown(
+                "> 💡 请选择至少 2 个模型进行对比",
+                visible=True,
+            )
+            with gr.Row():
+                with gr.Column(scale=1, min_width=200):
+                    parallel_md1 = gr.Markdown("", visible=False, elem_classes="parallel-card")
+                with gr.Column(scale=1, min_width=200):
+                    parallel_md2 = gr.Markdown("", visible=False, elem_classes="parallel-card")
+                with gr.Column(scale=1, min_width=200):
+                    parallel_md3 = gr.Markdown("", visible=False, elem_classes="parallel-card")
+                with gr.Column(scale=1, min_width=200):
+                    parallel_md4 = gr.Markdown("", visible=False, elem_classes="parallel-card")
+
+        # ================================================================
+        # 底部：Token 统计
+        # ================================================================
+        with gr.Row(elem_classes="token-bar"):
+            token_md = gr.Markdown("")
 
         # ================================================================
         # 事件绑定

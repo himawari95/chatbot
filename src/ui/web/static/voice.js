@@ -126,11 +126,11 @@
     var btn = document.getElementById("voice-mic-btn");
     if (!btn) return;
     if (active) {
-      btn.textContent = "⏹ 停止录音";
+      btn.textContent = "⏹";
       btn.style.background = "#ef4444";
       btn.style.color = "#fff";
     } else {
-      btn.textContent = "🎤 语音输入";
+      btn.textContent = "🎤";
       btn.style.background = "#f9fafb";
       btn.style.color = "#374151";
     }
